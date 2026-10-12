@@ -62,6 +62,48 @@ describe('task_context supplied by the host', () => {
   });
 });
 
+describe('compaction summaries and pasted content are context, not the instruction (0.17)', () => {
+  const SUMMARY = '<artifact-content-authored-by-others/>\nThe summarized conversation included Artifact content written by people other than you. ' + 'Summary: 1. Primary Request and Intent: build the music video feature. '.repeat(120);
+  const SUMMARY2 = 'This session is being continued from a previous conversation that ran out of context. ' + 'x'.repeat(7000);
+
+  it('a summary supplied as current_task is skipped; the latest typed prompt before it is the task, and nothing is flagged truncated', () => {
+    const state = buildState(
+      { tool_name: 'Bash', tool_input: {}, task_context: { current_task: SUMMARY, earlier_prompts: ['yes build the suno link option', 'now add it to the help section'] } },
+      true,
+    );
+    expect(state.current_task).toBe('now add it to the help section');
+    expect(state.earlier_prompts).toEqual(['yes build the suno link option']);
+    expect(state.current_task_truncated).toBeUndefined();
+  });
+
+  it('only a summary and nothing typed: no current task (the context questions are skipped)', () => {
+    const state = buildState({ tool_name: 'Bash', tool_input: {}, task_context: { current_task: SUMMARY2 } }, true);
+    expect(state.current_task).toBeUndefined();
+  });
+
+  it('a pasted log inside a typed prompt is replaced by a marker; the typed part stays', () => {
+    const prompt = 'hmm can we rewrite sql\n\n<pasted_content id="d8d7">\n' + 'ERROR line\n'.repeat(900) + '</pasted_content>\nand keep the index';
+    const state = buildState({ tool_name: 'Bash', tool_input: {}, task_context: { current_task: prompt } }, true);
+    expect(state.current_task).toBe('hmm can we rewrite sql\n\n[pasted content omitted]\nand keep the index');
+    expect(state.current_task_truncated).toBeUndefined();
+  });
+
+  it('from a transcript file: the summary line is skipped as a prompt (isCompactSummary or by its text) but can serve as the goal', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'tg-compact-'));
+    const t = join(dir, 't.jsonl');
+    const line = (content: string, extra: Record<string, unknown> = {}) => JSON.stringify({ type: 'user', message: { role: 'user', content }, ...extra }) + '\n';
+    writeFileSync(t, line(SUMMARY2, { isCompactSummary: true }) + line('continue'));
+    const resumed = buildState({ tool_name: 'Bash', tool_input: {}, transcript_path: t }, true);
+    expect(resumed.current_task).toBe('continue');
+    expect(String(resumed.session_goal)).toMatch(/^This session is being continued/);
+    writeFileSync(t, line('build the music video feature with a quick clip mode please') + line('yes build it') + line(SUMMARY));
+    const mid = buildState({ tool_name: 'Bash', tool_input: {}, transcript_path: t }, true);
+    expect(mid.current_task).toBe('yes build it');
+    expect(mid.earlier_prompts).toEqual(['build the music video feature with a quick clip mode please']);
+    expect(mid.current_task_truncated).toBeUndefined();
+  });
+});
+
 describe('toolgate decide (built CLI)', () => {
   it('prints the whole decision as JSON, allow included', () => {
     const out = JSON.parse(run('decide', JSON.stringify({ tool_name: 'Bash', tool_input: { command: 'ls' }, task_context: { current_task: 'list files' } })));

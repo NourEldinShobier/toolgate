@@ -46,13 +46,29 @@ function statusLine(): string {
   return `toolgate · allow ${counts.allow} · ask ${counts.ask} · deny ${counts.deny}${ms}`
 }
 
+// A compaction summary arrives as a user message but is the agent's, not the person's: it is not
+// the current instruction (0.16.0 window: 78 of 82 truncation asks were calls judged against one).
+// It can stand in as the session goal when nothing the person typed is long enough to.
+const COMPACTION_SUMMARY = /^(?:\s*<[\w-]+\/>\s*)*(?:This session is being continued from a previous conversation|The summarized conversation included)/
+const PASTED_CONTENT = /<pasted_content\b[^>]*>[\s\S]*?<\/pasted_content>/g
+
+function typedPart(text: string): string {
+  return text.replace(PASTED_CONTENT, '[pasted content omitted]').replace(/<artifact-content-authored-by-others\/>\s*/g, '').trim()
+}
+
 /** The user's prompts as toolgate wants them: current, the ones before (oldest first), the opening request. */
 function taskContextFrom(messages: ReadonlyArray<{ role: string; text: string }>) {
-  const prompts = messages.filter((m) => m.role === 'user' && m.text.trim().length > 0).map((m) => m.text)
-  if (prompts.length === 0) return undefined
+  const userTurns = messages.filter((m) => m.role === 'user' && m.text.trim().length > 0).map((m) => m.text)
+  const summaries = userTurns.filter((t) => COMPACTION_SUMMARY.test(t))
+  const prompts = userTurns.filter((t) => !COMPACTION_SUMMARY.test(t)).map(typedPart).filter((t) => t.length > 0)
+  if (prompts.length === 0) {
+    // Only a summary so far (a resumed session before the person typed): it is the goal, not the task.
+    const summary = summaries[0]
+    return summary ? { session_goal: summary.slice(0, 1200) } : undefined
+  }
   const current_task = prompts[prompts.length - 1]
   const earlier_prompts = prompts.slice(Math.max(0, prompts.length - 1 - EARLIER_PROMPTS), prompts.length - 1)
-  const session_goal = prompts.find((p) => p.length >= GOAL_MIN_CHARS)
+  const session_goal = prompts.find((p) => p.length >= GOAL_MIN_CHARS) ?? summaries[0]?.slice(0, 1200)
   return { current_task, earlier_prompts, session_goal }
 }
 
@@ -79,7 +95,10 @@ export const register: Register = (on, options) => {
       if (probe.exitCode === 0) {
         active = true
       } else {
-        inactiveReason = `${binary} exited ${probe.exitCode}`
+        // 0.15 and older have no `version` subcommand and exit 1 with the help text.
+        inactiveReason = /Unknown command/i.test(probe.stderr + probe.stdout)
+          ? `${binary} is older than 0.16; run: npm i -g @riskaverse/toolgate@latest`
+          : `${binary} exited ${probe.exitCode}`
       }
     } catch {
       inactiveReason = `${binary} not found; npm install -g @riskaverse/toolgate, or set the command in /config`
@@ -107,6 +126,7 @@ export const register: Register = (on, options) => {
       const payload = {
         session_id,
         cwd,
+        host: 'mod',
         tool_use_id: e.tool_use_id,
         tool_name: e.tool,
         tool_input: e.input,

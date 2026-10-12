@@ -3,6 +3,7 @@ import { homedir } from 'node:os';
 import { join } from 'node:path';
 import YAML from 'yaml';
 import type { Policy, Questions, StaticRule } from './types.js';
+import { DEFAULT_READ_ONLY_TOOLS } from './readonly.js';
 
 export const DEFAULT_QUESTIONS: Questions = {
   destructive: {
@@ -172,7 +173,9 @@ export const DEFAULT_RULES: StaticRule[] = [
   {
     match: {
       tool: 'Bash',
-      input_regex: `(?:>>?|\\b(?:tee|cp|mv|rm|ln|chmod|chown|truncate)\\b|\\bsed\\s+-i)[^\\n]*${SAFETY_FILES}`,
+      // `2>/dev/null` and `2>&1` before the path are not writes to it (0.16.0 window: a grep of
+      // settings.json was flagged as modifying it).
+      input_regex: `(?:(?<![\\d&])>>?(?!&|\\s*/dev/null)|\\b(?:tee|cp|mv|rm|ln|chmod|chown|truncate)\\b|\\bsed\\s+-i)[^\\n]*${SAFETY_FILES}`,
     },
     action: 'ask',
     reason: 'Modifies agent safety settings or the toolgate policy',
@@ -193,6 +196,8 @@ export function defaultPolicy(): Policy {
     trusted_hosts: [],
     trusted_tools: '',
     include_task_context: true,
+    read_only_tools: DEFAULT_READ_ONLY_TOOLS,
+    confirmation_memory: true,
     show_allows: false,
     limits: { input_chars: 40000, task_chars: 6000, earlier_prompts: 2, session_goal_chars: 1200 },
     unattended: { modes: ['bypassPermissions', 'dontAsk'], ask: 'deny' },
@@ -253,6 +258,8 @@ function mergePolicy(base: Policy, user: Record<string, unknown>): Policy {
     // A matcher string, or a YAML list of tool names joined into one.
     trusted_tools: normalizeMatcher(user.trusted_tools, base.trusted_tools),
     include_task_context: (user.include_task_context as boolean) ?? base.include_task_context,
+    read_only_tools: normalizeMatcher(user.read_only_tools, base.read_only_tools),
+    confirmation_memory: (user.confirmation_memory as boolean) ?? base.confirmation_memory,
     show_allows: (user.show_allows as boolean) ?? base.show_allows,
     limits: { ...base.limits, ...obj(user.limits) },
     unattended: { ...base.unattended, ...obj(user.unattended) },
@@ -291,6 +298,9 @@ export function validatePolicy(p: Policy): void {
     }
   }
   if (typeof p.include_task_context !== 'boolean') fail('include_task_context must be true or false');
+  if (typeof p.read_only_tools !== 'string') fail('read_only_tools must be a tool matcher string or a list of tool names');
+  toolMatcherToRegex(p.read_only_tools);
+  if (typeof p.confirmation_memory !== 'boolean') fail('confirmation_memory must be true or false');
   if (typeof p.show_allows !== 'boolean') fail('show_allows must be true or false');
   for (const k of ['input_chars', 'task_chars', 'earlier_prompts', 'session_goal_chars'] as const) {
     const v = p.limits[k];

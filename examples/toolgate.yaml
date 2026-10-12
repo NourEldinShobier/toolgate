@@ -43,12 +43,26 @@ trusted_tools: ""
 # (off_task, authorized, violates_constraint, unresolved_choice) have something to judge against.
 include_task_context: true
 
+# Tools that only read (whole-name matcher, same syntax as gated_tools). On these, and on a Bash
+# command every part of which is a read (ls, grep, git status, …), off_task alone cannot raise an
+# ask: being off-task is a reason for a human when something is about to change. Every other axis
+# is judged as usual. The default covers Read/Glob/Grep/WebSearch/WebFetch and MCP tools whose
+# name says read/get/list/search/find/navigate.
+#  read_only_tools: "Read|Glob|Grep|WebSearch|WebFetch|mcp__.*__(?:get|list|search)_.*"
+
+# An ask you confirmed is not asked again for the identical call (same tool, same input) in the
+# same session. Lifts the model's own ask to allow only: never a deny, a static rule, or a floor.
+# Not counted in auto mode or the unattended modes, where no person answered.
+confirmation_memory: true
+
 # Asks and denies always show a "[toolgate] …" line in Claude Code. Allows are quiet
 # unless this is on — the hook runs on every gated call.
 show_allows: false
 
 # How much the model sees. Input beyond input_chars is cut (head + tail) and the verdict
-# can then be no better than ask; the latest prompt beyond task_chars likewise.
+# can then be no better than ask. The latest prompt beyond task_chars is cut and flagged but does
+# not cap the verdict (0.17): a compaction summary arriving as a user turn is context, not the
+# instruction, and the typed prompt before it stays the task.
 # earlier_prompts: user prompts before the latest one, included as context so that a
 # "yes" or "continue" is read together with the instruction it continues.
 # session_goal_chars: the session's first substantive prompt (≥ 40 chars) is included as

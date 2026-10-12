@@ -41,6 +41,8 @@ export interface HookInput {
    * Claude Code mod, a library caller). When present, `transcript_path` is not read.
    */
   task_context?: TaskContext;
+  /** Which host made the call (`hook`, `mod`, `proxy`, `check`); stamped on the audit row so a window can be cut by host. */
+  host?: string;
 }
 
 /** User prompts as a host supplies them: the current one, the ones before it (oldest first), the session's opening request. */
@@ -57,7 +59,8 @@ export type Verdict = DecisionAction | 'passthrough';
 export interface Decision {
   verdict: Verdict;
   reason: string;
-  source: 'static-rule' | 'model' | 'fail-mode' | 'no-opinion';
+  /** `confirmed`: the model asked, and the identical call was confirmed by the person earlier this session (probabilities still present). */
+  source: 'static-rule' | 'model' | 'fail-mode' | 'no-opinion' | 'confirmed';
   /** Per-question probabilities, when source === 'model'. `authorized` is a mitigator, not a risk. */
   probabilities?: Record<string, number>;
   /** Artifact capability answers (write tools only). Metadata for the ledger; excluded from the verdict. */
@@ -110,11 +113,25 @@ export interface Policy {
   trusted_tools: string;
   /** Read the current task from the transcript so `off_task` has context. */
   include_task_context: boolean;
+  /**
+   * Tools that only read (whole-name matcher like `gated_tools`). On these, and on a Bash command
+   * every part of which is a read (`ls`, `grep`, `git status`, …), `off_task` alone cannot raise an
+   * ask: being off-task is a reason for a human when something is about to change. Every other
+   * axis is judged as usual.
+   */
+  read_only_tools: string;
+  /**
+   * An ask the person confirmed is not asked again for the identical call (same tool, same input)
+   * in the same session. Lifts a threshold ask to allow only; never a deny, a static rule, or a
+   * floor. Not counted in auto mode or the unattended modes, where no person answered.
+   */
+  confirmation_memory: boolean;
   /** Show a "[toolgate] all risks below …" line on allowed calls too. Off by default: asks and denies are always shown. */
   show_allows: boolean;
   /**
    * How much the model sees. Input beyond `input_chars` is cut (head + tail) and the verdict
-   * can then be no better than `ask`; the latest user prompt beyond `task_chars` likewise.
+   * can then be no better than `ask`. The latest user prompt beyond `task_chars` is cut and
+   * flagged (`current_task_truncated`) but does not cap the verdict (0.17).
    * `earlier_prompts`: how many user prompts before the latest to include as context, so a
    * "yes" or "continue" is read together with the instruction it continues.
    */

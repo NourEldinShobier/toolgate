@@ -131,10 +131,19 @@ describe('static rule: agent safety settings (ask)', () => {
     expect(await decide(bash('cp evil.json ~/.claude/settings.json'), defaultPolicy(), never)).toMatchObject({ verdict: 'ask' });
   });
 
-  it('does not fire on read-only mentions', async () => {
-    for (const cmd of ['cat ~/.claude/settings.json', 'ls ~/.toolgate']) {
-      expect((await decide(bash(cmd), defaultPolicy(), new StubBackend({}))).source).not.toBe('static-rule');
+  it('does not fire on read-only mentions, including with stderr silenced or merged before the path (0.17)', async () => {
+    for (const cmd of [
+      'cat ~/.claude/settings.json',
+      'ls ~/.toolgate',
+      'grep -n toolgate ~/.claude/settings.json 2>/dev/null',
+      'python3 -c "import json" 2>&1 | grep hooks ~/.claude/settings.json',
+      'cat ~/.claude/settings.json 2>&1 >/dev/null',
+    ]) {
+      expect((await decide(bash(cmd), defaultPolicy(), new StubBackend({}))).source, cmd).not.toBe('static-rule');
     }
+    // a real redirect into it still asks
+    expect(await decide(bash('jq . x.json > ~/.claude/settings.json'), defaultPolicy(), never)).toMatchObject({ verdict: 'ask', source: 'static-rule' });
+    expect(await decide(bash('echo x >> ~/.claude/settings.json'), defaultPolicy(), never)).toMatchObject({ verdict: 'ask', source: 'static-rule' });
   });
 
   it('matches keys as well as values in tool input', async () => {
@@ -361,11 +370,19 @@ describe('v0.4 floors: violates_constraint and unresolved_choice', () => {
 });
 
 describe('task context truncation', () => {
-  it('flags a truncated task and caps the verdict at ask', async () => {
+  it('flags a truncated task but does not floor the verdict (0.17: the floor is for tool input only)', async () => {
     const long = 'Deploy to staging. '.repeat(400); // ~7600 chars > 6000 budget
     const d = await decide(bashWithTask('npm test', long), defaultPolicy(), new StubBackend({}));
     expect(d.state?.current_task_truncated).toBe(true);
+    expect(d.verdict).toBe('allow');
+  });
+
+  it('still floors an allow at ask when the TOOL INPUT was cut', async () => {
+    const huge = 'echo ' + 'x'.repeat(50_000);
+    const d = await decide(bashWithTask(huge, 'print something'), defaultPolicy(), new StubBackend({}));
+    expect((d.state?.tool_input as { _truncated?: boolean })._truncated).toBe(true);
     expect(d.verdict).toBe('ask');
+    expect(d.reason).toMatch(/too large/);
   });
 
   it('keeps a 1.3k-char task intact (the set-2 case)', async () => {
@@ -848,5 +865,62 @@ describe('content is not action framing (0.15)', () => {
       expect(a, k).toBeGreaterThan(0);
       expect(b, k).toBeGreaterThan(a);
     }
+  });
+});
+
+describe('read-only calls: off_task alone does not interrupt (0.17)', () => {
+  const offTask = { off_task: 0.8 };
+  it('a read-only Bash command with off_task over the ask line is allowed, and the reason says why', async () => {
+    const d = await decide(bashWithTask('grep -n "foo" src/*.ts | head -20', 'write the release notes'), defaultPolicy(), new StubBackend(offTask));
+    expect(d.verdict).toBe('allow');
+    expect(d.reason).toMatch(/not raised alone on a read-only call/);
+  });
+  it('a Bash command that writes is still asked on off_task', async () => {
+    const d = await decide(bashWithTask('grep -n foo src/*.ts > out.txt', 'write the release notes'), defaultPolicy(), new StubBackend(offTask));
+    expect(d.verdict).toBe('ask');
+  });
+  it('a read-only tool (WebSearch, a browser page read) is allowed on off_task alone', async () => {
+    for (const tool of ['WebSearch', 'WebFetch', 'mcp__Claude_Browser__navigate', 'mcp__Claude_Browser__get_page_text', 'mcp__brave__brave_web_search']) {
+      const input: HookInput = { ...bashWithTask('x', 'write the release notes'), tool_name: tool, tool_input: { query: 'competitor pricing' } };
+      const d = await decide(input, defaultPolicy(), new StubBackend(offTask));
+      expect(d.verdict, tool).toBe('allow');
+    }
+  });
+  it('every other axis is judged as usual on a read-only call', async () => {
+    const d = await decide(bashWithTask('cat .env', 'write the release notes'), defaultPolicy(), new StubBackend({ off_task: 0.8, secret_exposure: 0.7 }));
+    expect(d.verdict).toBe('ask');
+    expect(d.reason).toMatch(/secret exposure/);
+  });
+  it('a browser action that clicks is not read-only', async () => {
+    const input: HookInput = { ...bashWithTask('x', 'write the release notes'), tool_name: 'mcp__Claude_Browser__javascript_tool', tool_input: { text: 'document.querySelector("button").click()' } };
+    const d = await decide(input, defaultPolicy(), new StubBackend(offTask));
+    expect(d.verdict).toBe('ask');
+  });
+});
+
+describe('confirmation memory (0.17)', () => {
+  const probs = { destructive: 0.7, authorized: 0.6 };
+  it('lifts the model\'s ask to allow with source confirmed when the identical call was confirmed earlier', async () => {
+    const d = await decide(bashWithTask('rm -r src/__preview && npx vite build', 'clean up the preview'), defaultPolicy(), new StubBackend(probs), { confirmedEarlier: true });
+    expect(d.verdict).toBe('allow');
+    expect(d.source).toBe('confirmed');
+    expect(d.reason).toMatch(/confirmed earlier this session/);
+    expect(d.probabilities?.destructive).toBe(0.7);
+  });
+  it('never lifts a deny', async () => {
+    const d = await decide(bashWithTask('rm -r src/__preview', 'clean up'), defaultPolicy(), new StubBackend({ destructive: 0.9 }), { confirmedEarlier: true });
+    expect(d.verdict).toBe('deny');
+    expect(d.source).toBe('model');
+  });
+  it('never lifts a floor: truncated input stays an ask even when confirmed before', async () => {
+    const huge = 'rm -r src/__preview # ' + 'x'.repeat(50_000);
+    const d = await decide(bashWithTask(huge, 'clean up'), defaultPolicy(), new StubBackend(probs), { confirmedEarlier: true });
+    expect(d.verdict).toBe('ask');
+    expect(d.source).toBe('model');
+  });
+  it('does nothing when the call was not confirmed before', async () => {
+    const d = await decide(bashWithTask('rm -r src/__preview', 'clean up'), defaultPolicy(), new StubBackend(probs));
+    expect(d.verdict).toBe('ask');
+    expect(d.source).toBe('model');
   });
 });

@@ -271,7 +271,7 @@ export async function runMcp(opts: McpOptions, command: string[]): Promise<void>
       return;
     }
     inFlight++;
-    const input: HookInput = { tool_name: m.params.name, tool_input: m.params.arguments ?? {}, cwd: process.cwd() };
+    const input: HookInput = { tool_name: m.params.name, tool_input: m.params.arguments ?? {}, cwd: process.cwd(), host: 'proxy' };
     if (transcriptPath) input.transcript_path = transcriptPath;
     const claimed = opts.trusted === true || (trustMatcher?.test(m.params.name) ?? false);
     // Gate asynchronously so other traffic is never blocked behind a model call. If a tools/list

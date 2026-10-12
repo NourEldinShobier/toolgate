@@ -56,8 +56,9 @@ Usage:
   toolgate doctor
       Check policy, keys, key file, backend, one real decision, and that the installed hook answers.
 
-  toolgate audit [-n <count>] [--stats]
-      Show recent audit log entries, or summary statistics (ask/deny rate, latency).
+  toolgate audit [-n <count>] [--stats] [--since <ISO date | 7d | 24h>] [--host hook|mod|proxy]
+      Show recent audit log entries, or summary statistics (ask/deny rate, latency), optionally
+      restricted to a time window and a host — the cut a measurement window is declared on.
 
 Environment (one key is enough; precedence TYPESAFE > OPENROUTER > AI_GATEWAY when several are set):
   TYPESAFE_API_KEY     TypeSafe direct API key (console.typesafe.ai → API Keys)
@@ -98,6 +99,8 @@ async function main(): Promise<void> {
       task: { type: 'string', multiple: true },
       n: { type: 'string', short: 'n', default: '20' },
       stats: { type: 'boolean' },
+      since: { type: 'string' },
+      host: { type: 'string' },
       print: { type: 'boolean' },
       gate: { type: 'string' },
       'on-ask': { type: 'string' },
@@ -114,6 +117,8 @@ async function main(): Promise<void> {
     tasks: Array.isArray(values.task) ? values.task.filter((v): v is string => typeof v === 'string') : [],
     n: str(values.n),
     stats: values.stats === true,
+    since: str(values.since),
+    host: str(values.host),
     print: values.print === true,
     gate: str(values.gate),
     onAsk: str(values['on-ask']),
@@ -151,7 +156,7 @@ async function main(): Promise<void> {
       } catch {
         toolInput = args.tool === 'Bash' ? { command: raw } : raw;
       }
-      const input: HookInput = { tool_name: args.tool, tool_input: toolInput, cwd: process.cwd() };
+      const input: HookInput = { tool_name: args.tool, tool_input: toolInput, cwd: process.cwd(), host: 'check' };
       if (args.tasks.length > 0) {
         // A transcript of user prompts (in order given; the last is the current task) so the context questions are asked.
         const transcript = join(mkdtempSync(join(tmpdir(), 'toolgate-')), 'transcript.jsonl');
@@ -206,7 +211,8 @@ async function main(): Promise<void> {
     case 'audit': {
       const policy = loadPolicy(args.policy);
       if (!existsSync(policy.audit.path)) return console.log(`No audit log at ${policy.audit.path}`);
-      const all = readFileSync(policy.audit.path, 'utf8').trimEnd().split('\n');
+      let all = readFileSync(policy.audit.path, 'utf8').trimEnd().split('\n');
+      if (args.since || args.host) all = filterAudit(all, args.since, args.host);
       if (args.stats) return printStats(all);
       const n = Math.max(1, Number(args.n) || 20);
       const lines = all.slice(-n);
@@ -302,6 +308,30 @@ function install(): void {
   console.log(`${result === 'added' ? 'Installed' : 'Updated'} hook in ${SETTINGS_PATH}${backup ? ` (backup: ${backup})` : ''}:\n  ${hookCommand()}`);
 }
 
+/** `--since 7d`, `--since 24h`, `--since 2026-10-03`, `--since 2026-10-03T00:00:00-04:00`; `--host mod`. Rows without a host match only when no host filter is given. */
+export function filterAudit(lines: string[], since?: string, host?: string): string[] {
+  let from: number | undefined;
+  if (since) {
+    const rel = /^(\d+)\s*([dhm])$/.exec(since.trim());
+    if (rel) from = Date.now() - Number(rel[1]) * { d: 86_400_000, h: 3_600_000, m: 60_000 }[rel[2] as 'd' | 'h' | 'm']!;
+    else {
+      const t = Date.parse(since);
+      if (Number.isNaN(t)) throw new Error(`--since: expected an ISO date or a duration like 7d / 24h, got "${since}"`);
+      from = t;
+    }
+  }
+  return lines.filter((l) => {
+    try {
+      const e = JSON.parse(l) as { ts?: string; host?: string };
+      if (from !== undefined && !(typeof e.ts === 'string' && Date.parse(e.ts) >= from)) return false;
+      if (host !== undefined && e.host !== host) return false;
+      return true;
+    } catch {
+      return false;
+    }
+  });
+}
+
 function printStats(lines: string[]): void {
   const rows = lines.map((l) => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean) as Array<Record<string, unknown>>;
   if (rows.length === 0) return console.log('no decisions logged yet');
@@ -328,6 +358,10 @@ function printStats(lines: string[]): void {
   if (modelRows.length) console.log(`context:  task present ${withTask}/${modelRows.length}, input truncated ${truncated}/${modelRows.length}`);
   const modes = by('permission_mode');
   if (Object.keys(modes).some((k) => k !== 'undefined')) console.log(`modes:    ${Object.entries(modes).map(([k, v]) => `${k} ${v}`).join(', ')}`);
+  const hosts = by('host');
+  if (Object.keys(hosts).some((k) => k !== 'undefined')) console.log(`hosts:    ${Object.entries(hosts).map(([k, v]) => `${k} ${v}`).join(', ')}`);
+  const versions = by('toolgate_version');
+  console.log(`versions: ${Object.entries(versions).map(([k, v]) => `${k} ${v}`).join(', ')}`);
   const asked = rows.filter((r) => r.verdict === 'ask' || r.verdict === 'deny');
   if (asked.length) {
     console.log(`\nrecent ask/deny:`);

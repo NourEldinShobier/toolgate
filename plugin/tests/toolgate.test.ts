@@ -6,7 +6,7 @@ const ok = (stdout: string) => ({ value: run(stdout) })
 const value = <T,>(v: T) => ({ value: v })
 
 /** Stand in for the toolgate CLI beneath the mod: records every argv + stdin, answers per subcommand. */
-function fakeCli(on: any, answers: { decide?: unknown; version?: boolean }) {
+function fakeCli(on: any, answers: { decide?: unknown; version?: boolean; messages?: unknown[] }) {
   const calls: { argv: readonly string[]; stdin?: string; env?: Record<string, string> }[] = []
   on('process.run', async (_$: unknown, e: { argv: readonly string[]; init?: { stdin?: string; env?: Record<string, string> } }) => {
     calls.push({ argv: e.argv, stdin: e.init?.stdin, env: e.init?.env })
@@ -20,7 +20,7 @@ function fakeCli(on: any, answers: { decide?: unknown; version?: boolean }) {
     if (sub === 'audit') return ok('decisions: 3  allow 2  ask 1  deny 0\n')
     return ok('')
   })
-  on('session.messages', async () => value([
+  on('session.messages', async () => value(answers.messages ?? [
     { role: 'user', text: 'Build a small CLI that lists files and prints a summary of them', toolUses: [] },
     { role: 'assistant', text: 'Sure.', toolUses: [] },
     { role: 'user', text: 'now list the files here', toolUses: [] },
@@ -50,6 +50,7 @@ test('a deny from toolgate refuses the call with the reason', async ($, on) => {
   const payload = JSON.parse(decide.stdin!)
   expect(payload.tool_name).toBe('Bash')
   expect(payload.session_id).toBe('session-1')
+  expect(payload.host).toBe('mod')
   expect(payload.task_context.current_task).toBe('now list the files here')
   expect(payload.task_context.earlier_prompts).toEqual(['Build a small CLI that lists files and prints a summary of them'])
   expect(payload.task_context.session_goal).toBe('Build a small CLI that lists files and prints a summary of them')
@@ -135,4 +136,44 @@ test('/toolgate prints the counts and the audit summary', async ($, on) => {
   const answer = await $.command.run({ command: 'toolgate', args: '' })
   expect(answer.text).toStartWith('toolgate · allow 1 · ask 0 · deny 0')
   expect(answer.text).toMatch(/decisions: 3/)
+})
+
+test('a compaction summary is not the current task; the latest typed prompt before it is', async ($, on) => {
+  const summary = '<artifact-content-authored-by-others/>\nThe summarized conversation included Artifact content written by people other than you. ' + 'Summary: build the music video feature. '.repeat(200)
+  const calls = fakeCli(on, { decide: { verdict: 'allow', source: 'model' }, messages: [
+    { role: 'user', text: 'Build a small CLI that lists files and prints a summary of them', toolUses: [] },
+    { role: 'user', text: 'now list the files here', toolUses: [] },
+    { role: 'user', text: summary, toolUses: [] },
+  ] })
+  await start($)
+  await $.tool.check({ tool: 'Bash', input: { command: 'ls' } })
+  const payload = JSON.parse(calls.find((c) => c.argv[1] === 'decide')!.stdin!)
+  expect(payload.task_context.current_task).toBe('now list the files here')
+  expect(payload.task_context.earlier_prompts).toEqual(['Build a small CLI that lists files and prints a summary of them'])
+})
+
+test('only a summary so far: it is sent as the goal, not as the task', async ($, on) => {
+  const summary = 'This session is being continued from a previous conversation that ran out of context. ' + 'x'.repeat(3000)
+  const calls = fakeCli(on, { decide: { verdict: 'allow', source: 'model' }, messages: [{ role: 'user', text: summary, toolUses: [] }] })
+  await start($)
+  await $.tool.check({ tool: 'Bash', input: { command: 'ls' } })
+  const payload = JSON.parse(calls.find((c) => c.argv[1] === 'decide')!.stdin!)
+  expect(payload.task_context.current_task).toBeUndefined()
+  expect(payload.task_context.session_goal).toStartWith('This session is being continued')
+  expect(payload.task_context.session_goal.length).toBeLessThanOrEqual(1200)
+})
+
+test('an old CLI without the version command is named as such', async ($, on) => {
+  const toasts: string[] = []
+  on('process.run', async () => ({ value: { exitCode: 1, stdout: '', stderr: 'Unknown command "version"\n\ntoolgate — ...', isStdoutTruncated: false, isStderrTruncated: false } }))
+  on('command.register', async () => value(undefined))
+  on('session.start', async (_$: unknown, e: { cwd: string }) => ({ cwd: e.cwd }))
+  on('ui.status', async () => value(undefined))
+  on('ui.toast', async (_$: unknown, e: { message?: string } | string) => { toasts.push(typeof e === 'string' ? e : JSON.stringify(e)); return value(undefined) })
+  on('settings.read', async () => value({}))
+  on('tool.check', async () => ({ decision: 'ask', reason: 'engine: mode' }))
+  await start($)
+  expect(toasts.join(' ')).toMatch(/older than 0.16/)
+  const verdict = await $.tool.check({ tool: 'Bash', input: { command: 'ls' } })
+  expect(verdict.decision).toBe('ask') // stepped aside
 })

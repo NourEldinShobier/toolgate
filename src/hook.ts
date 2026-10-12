@@ -4,6 +4,7 @@ import { decide, message } from './engine.js';
 import { writeAudit } from './audit.js';
 import { MockBackend } from './backends/mock.js';
 import { recordProposed, settle } from './ledger.js';
+import { confirmAsked, recordAsked, wasConfirmed } from './confirm.js';
 
 /**
  * Loads the AI SDK only when the model is actually consulted. Importing `ai`
@@ -141,7 +142,7 @@ export async function runHook(opts: { policyPath?: string; backend?: string } = 
   loadEnvFile();
   let out: Record<string, unknown> | undefined;
   try {
-    const { decision, policy } = await decideStdin(opts);
+    const { decision, policy } = await decideStdin(opts, 'hook');
     out = toHookOutput(decision, { showAllows: policy.show_allows });
   } catch (err) {
     const why = message(err);
@@ -162,7 +163,7 @@ export async function runDecide(opts: { policyPath?: string; backend?: string } 
   loadEnvFile();
   let decision: Decision;
   try {
-    decision = (await decideStdin(opts)).decision;
+    decision = (await decideStdin(opts, 'decide')).decision;
   } catch (err) {
     const why = message(err);
     process.stderr.write(`toolgate: ${why}\n`);
@@ -172,17 +173,20 @@ export async function runDecide(opts: { policyPath?: string; backend?: string } 
 }
 
 /** Read a PreToolUse payload from stdin, decide it, audit it, and propose any write to the ledger. */
-async function decideStdin(opts: { policyPath?: string; backend?: string }): Promise<{ decision: Decision; policy: Policy }> {
+async function decideStdin(opts: { policyPath?: string; backend?: string }, defaultHost: string): Promise<{ decision: Decision; policy: Policy }> {
   const input = JSON.parse(await readStdin()) as HookInput;
   if (typeof input?.tool_name !== 'string') throw new Error('stdin is not a PreToolUse payload');
+  if (typeof input.host !== 'string' || !/^[a-z][a-z0-9_-]{0,31}$/.test(input.host)) input.host = defaultHost;
   const policy = loadPolicy(opts.policyPath);
   const backend = makeBackend(policy, opts.backend);
-  const decision = await decide(input, policy, backend);
+  const decision = await decide(input, policy, backend, { confirmedEarlier: wasConfirmed(policy, input) });
   if (decision.source !== 'no-opinion') writeAudit(policy, input, decision, backend.name);
   if (decision.source === 'fail-mode') process.stderr.write(`toolgate: ${decision.reason}\n`); // never silent
   // Ledger: a write tool call is PROPOSED here (with what the content could do if executed) and
   // becomes CONFIRMED when PostToolUse arrives for the same tool_use_id (`toolgate post`).
   if (decision.verdict !== 'deny') recordProposed(policy, input, decision.capabilities, decision.capability_probs);
+  // Confirmation memory: the model's own ask is remembered; PostToolUse for this tool_use_id confirms it.
+  if (decision.verdict === 'ask' && decision.source === 'model') recordAsked(policy, input);
   return { decision, policy };
 }
 
@@ -199,7 +203,9 @@ export async function runPost(opts: { policyPath?: string } = {}): Promise<void>
     if (!input?.session_id || !input.tool_use_id) return;
     const status = POST_STATUS[input.hook_event_name ?? ''];
     if (!status) return;
-    settle(loadPolicy(opts.policyPath), input.session_id, input.tool_use_id, status);
+    const policy = loadPolicy(opts.policyPath);
+    settle(policy, input.session_id, input.tool_use_id, status);
+    if (status === 'confirmed') confirmAsked(policy, input.session_id, input.tool_use_id);
   } catch {
     // silent by design
   }

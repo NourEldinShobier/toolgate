@@ -11,12 +11,35 @@ const GOAL_SCAN_BYTES = 512 * 1024;
 const TRANSCRIPT_CHUNK_BYTES = 256 * 1024;
 const TRANSCRIPT_MAX_BYTES = 16 * 1024 * 1024;
 
+/**
+ * Within a line only (`[ \t]*`, never `\s*`): an empty `DO_SPACES_KEY=` at the end of a line must not
+ * run across the newline and swallow the next line's variable name as if it were the value. The
+ * 0.16.0 measurement window's blind reviewer caught exactly that in a `.env.example` template.
+ */
 const SECRET_PATTERNS: Array<[RegExp, string]> = [
-  [/\b([A-Z0-9_]*(?:KEY|TOKEN|SECRET|PASSWORD|PASSWD)[A-Z0-9_]*\s*[=:]\s*)\S+/gi, '$1[redacted]'],
-  [/(\bauthorization\s*:\s*)\S+(?:\s+\S+)?/gi, '$1[redacted]'],
-  [/(--?(?:password|passwd|token|api-?key|secret)[=\s]+)\S+/gi, '$1[redacted]'],
+  [/\b([A-Z0-9_]*(?:KEY|TOKEN|SECRET|PASSWORD|PASSWD)[A-Z0-9_]*[ \t]*[=:][ \t]*)\S+/gi, '$1[redacted]'],
+  [/(\bauthorization[ \t]*:[ \t]*)\S+(?:[ \t]+\S+)?/gi, '$1[redacted]'],
+  [/(--?(?:password|passwd|token|api-?key|secret)(?:=|[ \t]+))\S+/gi, '$1[redacted]'],
   [/\b(?:gh[pousr]_|sk-|xox[baprs]-|AKIA)[A-Za-z0-9_-]{12,}/g, '[redacted]'],
 ];
+
+/**
+ * User turns that are not the person's instruction. A compaction summary is written by the agent
+ * when its context window fills and arrives as a user message, far longer than any typed prompt;
+ * judging the next hour of tool calls against it (0.16.0 window: 78 of 82 truncation asks) is
+ * judging against the wrong thing. Treated as context: skipped as a prompt, usable as the goal.
+ */
+const COMPACTION_SUMMARY = /^(?:\s*<[\w-]+\/>\s*)*(?:This session is being continued from a previous conversation|The summarized conversation included)/;
+const PASTED_CONTENT = /<pasted_content\b[^>]*>[\s\S]*?<\/pasted_content>/g;
+
+export function isCompactionSummary(text: string): boolean {
+  return COMPACTION_SUMMARY.test(text);
+}
+
+/** A pasted log or table is material the person attached, not what they asked for: keep the typed part. */
+export function withoutPastedContent(text: string): string {
+  return text.replace(PASTED_CONTENT, '[pasted content omitted]').replace(/<artifact-content-authored-by-others\/>\s*/g, '').trim();
+}
 
 /**
  * JSON keys whose values are secrets regardless of what the value looks like. Structured input
@@ -112,13 +135,18 @@ function promptsFrom(input: HookInput, limits: Limits): string[] | undefined {
   const tc = input.task_context;
   if (!tc || typeof tc.current_task !== 'string' || tc.current_task.length === 0) return undefined;
   const earlier = (tc.earlier_prompts ?? []).filter((p): p is string => typeof p === 'string' && p.length > 0);
-  // earlier_prompts arrive oldest first; recentUserPrompts' order is newest first.
-  return [tc.current_task, ...earlier.slice(-limits.earlier_prompts).reverse()];
+  // earlier_prompts arrive oldest first; recentUserPrompts' order is newest first. A host that did
+  // not filter compaction summaries itself gets the same treatment as the transcript path.
+  const prompts = [tc.current_task, ...earlier.reverse()].filter((p) => !isCompactionSummary(p)).map(withoutPastedContent).filter((p) => p.length > 0);
+  if (prompts.length === 0) return undefined;
+  return prompts.slice(0, 1 + limits.earlier_prompts);
 }
 
 function goalFrom(input: HookInput): string | undefined {
   const g = input.task_context?.session_goal;
-  return typeof g === 'string' && g.length >= GOAL_MIN_CHARS ? g : undefined;
+  if (typeof g !== 'string') return undefined;
+  const goal = withoutPastedContent(g);
+  return goal.length >= GOAL_MIN_CHARS ? goal : undefined;
 }
 
 /**
@@ -135,7 +163,9 @@ export function sessionGoal(transcriptPath: string): string | undefined {
     const lines = buf.toString('utf8').split('\n');
     if (size === GOAL_SCAN_BYTES) lines.pop(); // the last line may be cut
     for (const line of lines) {
-      const text = userText(line);
+      // A resumed session may open with the compaction summary of the one before: as the goal,
+      // that summary is the best statement of what the agent was asked to do.
+      const text = userText(line, true);
       if (text && text.length >= GOAL_MIN_CHARS) return text;
     }
   } catch {
@@ -146,11 +176,15 @@ export function sessionGoal(transcriptPath: string): string | undefined {
   return undefined;
 }
 
-/** True when either the tool input or the task context was cut — the model did not see everything. */
+/**
+ * True when the tool input was cut — the model did not see what it is authorizing. A cut prompt
+ * (`current_task_truncated`) is flagged in the state and the audit row but does not floor the
+ * verdict: 6,000 characters show the whole instruction in practice (p90 of prompt length in the
+ * 0.16.0 window was 885), and what was being cut was compaction summaries, not instructions.
+ */
 export function isTruncated(state: JSONObject): boolean {
   const t = state.tool_input;
-  const inputCut = typeof t === 'object' && t !== null && !Array.isArray(t) && t._truncated === true;
-  return inputCut || state.current_task_truncated === true;
+  return typeof t === 'object' && t !== null && !Array.isArray(t) && t._truncated === true;
 }
 
 /**
@@ -216,7 +250,7 @@ export function recentUserPrompts(transcriptPath: string, count: number): string
   return found;
 }
 
-function userText(line: string | undefined): string | undefined {
+function userText(line: string | undefined, allowSummary = false): string | undefined {
   if (!line) return undefined;
   let e: Record<string, unknown>;
   try {
@@ -225,6 +259,7 @@ function userText(line: string | undefined): string | undefined {
     return undefined;
   }
   if (e.type !== 'user' || e.isSidechain === true || e.isMeta === true) return undefined;
+  if (e.isCompactSummary === true && !allowSummary) return undefined;
   const content = (e.message as { content?: unknown } | undefined)?.content;
   const raw =
     typeof content === 'string'
@@ -239,7 +274,9 @@ function userText(line: string | undefined): string | undefined {
     .replace(/<system-reminder>[\s\S]*?<\/system-reminder>/g, '')
     .replace(/<command-name>[\s\S]*?<\/command-name>/g, '')
     .trim();
-  return cleaned || undefined;
+  if (!cleaned) return undefined;
+  if (isCompactionSummary(cleaned)) return allowSummary ? cleaned : undefined;
+  return withoutPastedContent(cleaned) || undefined;
 }
 
 function toJSON(v: unknown): JSONValue {

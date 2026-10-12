@@ -2,6 +2,7 @@ import type { Answers, ArtifactCapabilities, Decision, DecisionBackend, HookInpu
 import { ASK_CEILING, CAPABILITY_KEYS, CAPABILITY_QUESTIONS, CONTEXT_QUESTIONS, UNSOFTENABLE, WRITE_TOOLS, toolMatcherToRegex } from './policy.js';
 import { buildState, isTruncated, matchText } from './state.js';
 import { compositionFacts, executeShaped, ledgerUnavailable } from './ledger.js';
+import { isReadOnlyBash } from './readonly.js';
 
 /**
  * Content is not action (0.15.0). From the 0.7.1 real-usage report: text that describes a harmful
@@ -55,6 +56,16 @@ export interface DecideOptions {
    * to a name a caller merely claims.
    */
   trustedTool?: boolean;
+  /** The identical call was asked and confirmed by the person earlier this session (see confirm.ts). */
+  confirmedEarlier?: boolean;
+}
+
+/** A call that only reads: `off_task` alone does not interrupt it. */
+export function isReadOnlyCall(input: HookInput, policy: Policy): boolean {
+  if (toolMatcherToRegex(policy.read_only_tools).test(input.tool_name)) return true;
+  if (input.tool_name !== 'Bash') return false;
+  const command = (input.tool_input as { command?: unknown } | undefined)?.command;
+  return typeof command === 'string' && isReadOnlyBash(command);
 }
 
 export async function decide(input: HookInput, policy: Policy, backend: DecisionBackend, opts: DecideOptions = {}): Promise<Decision> {
@@ -160,6 +171,9 @@ export async function decide(input: HookInput, policy: Policy, backend: Decision
     (offTaskP === undefined || offTaskP < ask);
 
   const levelOf = (p: number): 0 | 1 | 2 => (p >= deny ? 2 : p >= ask ? 1 : 0);
+  // Off-task on a read is noise, not a reason to interrupt (0.17.0; from the 0.16.0 window).
+  const readOnly = isReadOnlyCall(input, policy);
+  let offTaskWaived: number | undefined;
   let worst = { key: 'none', p: 0, level: 0 as 0 | 1 | 2, softened: false };
   let reservedAxis: { key: string; p: number } | undefined; // a deny the reserved choice turned into an ask
   for (const key of Object.keys(questions)) {
@@ -171,6 +185,10 @@ export async function decide(input: HookInput, policy: Policy, backend: Decision
     if (reservedChoice && !UNSOFTENABLE.has(key) && key !== 'off_task' && level === 2) {
       level = 1;
       if (!reservedAxis || p > reservedAxis.p) reservedAxis = { key, p };
+    }
+    if (key === 'off_task' && readOnly && level > 0) {
+      level = 0;
+      offTaskWaived = p;
     }
     if (level > worst.level || (level === worst.level && p > worst.p)) worst = { key, p, level, softened };
   }
@@ -187,6 +205,15 @@ export async function decide(input: HookInput, policy: Policy, backend: Decision
   if (worst.softened) reason += `; task authorizes it (${pct(authorizedP!)})`;
   if (reservedAxis && verdict === 'ask') {
     reason += `; ${reservedAxis.key.replace(/_/g, ' ')} ${pct(reservedAxis.p)} would deny, but the task reserves this choice for you (${pct(reservedP!)})`;
+  }
+  if (offTaskWaived !== undefined && verdict === 'allow') reason += `; off task ${pct(offTaskWaived)} not raised alone on a read-only call`;
+  // Confirmation memory: the person already said yes to this exact call this session. Lifts the
+  // model's own ask only; the floors below still apply, and a deny is never lifted.
+  let source: Decision['source'] = 'model';
+  if (verdict === 'ask' && opts.confirmedEarlier) {
+    verdict = 'allow';
+    source = 'confirmed';
+    reason = `identical call confirmed earlier this session (${reason})`;
   }
   if (verdict === 'allow' && isTruncated(state)) {
     verdict = 'ask';
@@ -207,12 +234,13 @@ export async function decide(input: HookInput, policy: Policy, backend: Decision
       reason = `runs a file, and this session's action ledger could not be read (${shortPath(policy.ledger.dir)}) — confirm manually (${reason})`;
     }
   }
+  if (source === 'confirmed' && verdict !== 'allow') source = 'model'; // a floor re-raised it: the memory did not decide
   // Nobody answers a prompt in an unattended permission mode; an ask would be auto-resolved.
   if (verdict === 'ask' && policy.unattended.ask === 'deny' && input.permission_mode !== undefined && policy.unattended.modes.includes(input.permission_mode)) {
     verdict = 'deny';
     reason = `${reason} (no one to ask in ${input.permission_mode} mode, so denied)`;
   }
-  return { verdict, reason, source: 'model', probabilities, capabilities, capability_probs: capabilities ? capabilityProbs : undefined, latencyMs, setupMs, state };
+  return { verdict, reason, source, probabilities, capabilities, capability_probs: capabilities ? capabilityProbs : undefined, latencyMs, setupMs, state };
 }
 
 function shortPath(p: string): string {
