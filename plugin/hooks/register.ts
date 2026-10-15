@@ -82,7 +82,7 @@ function parseDecision(stdout: string): Decision | undefined {
 }
 
 export const register: Register = (on, options) => {
-  const binary = typeof options.binary === 'string' && options.binary.length > 0 ? options.binary : 'toolgate'
+  let binary = typeof options.binary === 'string' && options.binary.length > 0 ? options.binary : 'toolgate'
   const shadow = options.mode === 'shadow'
   const keyEnv: Record<string, string> = {}
   if (typeof options.typesafe_api_key === 'string' && options.typesafe_api_key.length > 0) keyEnv.TYPESAFE_API_KEY = options.typesafe_api_key
@@ -90,18 +90,45 @@ export const register: Register = (on, options) => {
 
   on('session.start', async ($, e, next) => {
     await $.command.register({ name: 'toolgate', description: 'toolgate: audit summary and this session’s verdict counts' })
-    try {
-      const probe = await $.process.run([binary, 'version'], { timeoutMs: 10_000 })
-      if (probe.exitCode === 0) {
+    // A desktop-app Claude Code has no shell PATH, so a bare `toolgate` is ENOENT there even though
+    // the terminal finds it (0.17.1). Resolve once: the configured command, then the login shells'
+    // PATH, then the usual npm global locations. Whatever answers `version` is used from then on.
+    const candidates: string[][] = [[binary, 'version']]
+    if (!binary.includes('/')) {
+      for (const sh of ['/bin/zsh', '/bin/bash']) candidates.push([sh, '-lc', `command -v ${binary}`])
+      for (const dir of ['/opt/homebrew/bin', '/usr/local/bin']) candidates.push([`${dir}/${binary}`, 'version'])
+    }
+    let olderCli = false
+    for (const argv of candidates) {
+      try {
+        const ran = await $.process.run(argv, { timeoutMs: 10_000 })
+        if (ran.exitCode !== 0) {
+          if (/Unknown command/i.test(ran.stderr + ran.stdout)) olderCli = true
+          continue
+        }
+        if (argv[1] === '-lc') {
+          // the login shell printed a path: verify it answers `version`
+          const found = ran.stdout.trim().split('\n')[0] ?? ''
+          if (!found.startsWith('/')) continue
+          const check = await $.process.run([found, 'version'], { timeoutMs: 10_000 })
+          if (check.exitCode !== 0) {
+            if (/Unknown command/i.test(check.stderr + check.stdout)) olderCli = true
+            continue
+          }
+          binary = found
+        } else {
+          binary = argv[0]!
+        }
         active = true
-      } else {
-        // 0.15 and older have no `version` subcommand and exit 1 with the help text.
-        inactiveReason = /Unknown command/i.test(probe.stderr + probe.stdout)
-          ? `${binary} is older than 0.16; run: npm i -g @riskaverse/toolgate@latest`
-          : `${binary} exited ${probe.exitCode}`
+        break
+      } catch {
+        // not found this way; try the next
       }
-    } catch {
-      inactiveReason = `${binary} not found; npm install -g @riskaverse/toolgate, or set the command in /config`
+    }
+    if (!active) {
+      inactiveReason = olderCli
+        ? `${binary} is older than 0.16; run: npm i -g @riskaverse/toolgate@latest`
+        : `${binary} not found on this app's PATH; npm install -g @riskaverse/toolgate, or set the full path in /config (the terminal's \`which toolgate\`)`
     }
     if (!active) $.ui.toast(`toolgate is not gating: ${inactiveReason}`)
     // The settings.json hook (toolgate init) and this mod gate the same calls: both installed means

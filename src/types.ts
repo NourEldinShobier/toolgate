@@ -72,6 +72,8 @@ export interface Decision {
   setupMs?: number;
   /** The exact (redacted, truncated) state sent to the model, when source === 'model'. Not written to the hook output. */
   state?: JSONObject;
+  /** The call only reads (read_only_tools or a read-only Bash command): off_task alone did not raise an ask. On the audit row so the classifier can be measured on real sessions. */
+  readOnly?: boolean;
 }
 
 export interface StaticRule {

@@ -286,8 +286,10 @@ async function doctor(policyPath?: string, backendOverride?: string): Promise<bo
   }
   const installed = commands[0];
   if (installed === undefined) {
-    line(false, `hook: not installed in ${SETTINGS_PATH} — run \`toolgate install\``);
-    return false;
+    // Not a failure by itself: the Claude Code mod gates without a settings.json hook. Both installed
+    // means every call is decided twice, so a mod user should see exactly this line.
+    line(true, `hook: not installed in ${SETTINGS_PATH} (fine if the Claude Code mod is gating: check /toolgate in a session; otherwise run \`toolgate install\`)`);
+    return ok;
   }
   const current = installed === hookCommand();
   line(current, current ? `hook: installed in ${SETTINGS_PATH}` : `hook: installed but not the current command (\`${installed}\`) — run \`toolgate install\` to refresh`);

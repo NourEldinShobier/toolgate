@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.17.1 — what the third window asked for
+
+`docs/usage-2026-10-15.md`: the first window cut by host from the log itself. 0.17.0, Oct 13, 318 decisions: ask 13.8% (20.9% → 15.6% → 13.8%), one deny, zero permissive misses on the author's pass. The three days around it run 17.5%. What 0.17.0 fixed is verified (the truncation floor fired once instead of 82 times, the read-only waiver 11 times, the confirmation memory once); what remains is the model's own `off_task` on investigative writes against reaction prompts, and exfiltration asks on the author's own services with `trusted_hosts` still empty.
+
+- **Read-only classifier handles quoted operators.** `grep -n "a|b" file | head` was split inside the quoted regex and not recognized; about one in nine of the window's off-task Bash asks were greps of that shape. Operators and redirections now count only outside quotes. Regression cases from the window.
+- **`read_only` on the audit row**, so the classifier can be measured on real sessions (the audit text strips quotes, so it could not be re-run on the log).
+- **The mod finds the CLI from a desktop-app launch.** A Dock-launched Claude Code has no shell PATH, so `toolgate` was ENOENT and the mod stepped aside with a toast while the settings.json hook did the work. The mod now resolves the command once at session start: as configured, then through `/bin/zsh -lc` and `/bin/bash -lc`, then `/opt/homebrew/bin` and `/usr/local/bin`. 13 hook tests.
+- **Default model pinned to `jev-1.13.0`.** Every published threshold and window was measured on 1.13.0, and TypeSafe moves `jev-latest` on its own schedule (to 1.14.0 about a week after this release). A new version is adopted here after a frozen-set run, by changing one constant, not by alias. `backend.model` still overrides.
+- `doctor` treats a missing settings.json hook as fine when the mod may be gating, instead of failing.
+- A `<task-notification>` pasted as a user turn is replaced by a marker like pasted content.
+- README: a "What 1.0 means" section (six public criteria, so pre-1.0 has a visible end); the project's position in the category stated in the intro; "What leaves your machine" corrected for 0.17 (a cut prompt no longer floors the verdict; compaction summaries are never sent as the prompt) and made explicit about what is never sent.
+
 ## 0.17.0 — what the second measurement window asked for
 
 Every change here comes from `docs/usage-2026-10-11.md` (1,633 decisions on 0.16.0, blind second labeling of 407 items). Replayed against that window with the recorded probabilities, the engine changes move it from **ask 15.6% to 8.6%** (allow 84.3% → 91.2%, denies unchanged at 3), with no allow becoming an ask. The replay cannot re-score the calls that were judged against a compaction summary, so the real number comes from the third window.

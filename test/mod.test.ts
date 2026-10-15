@@ -81,6 +81,12 @@ describe('compaction summaries and pasted content are context, not the instructi
     expect(state.current_task).toBeUndefined();
   });
 
+  it('a task notification pasted as a user turn is replaced by a marker too', () => {
+    const prompt = '<task-notification>\n<task-id>b109ceemm</task-id>\n<status>done</status>\n</task-notification>\nok now push it';
+    const state = buildState({ tool_name: 'Bash', tool_input: {}, task_context: { current_task: prompt } }, true);
+    expect(state.current_task).toBe('[task notification omitted]\nok now push it');
+  });
+
   it('a pasted log inside a typed prompt is replaced by a marker; the typed part stays', () => {
     const prompt = 'hmm can we rewrite sql\n\n<pasted_content id="d8d7">\n' + 'ERROR line\n'.repeat(900) + '</pasted_content>\nand keep the index';
     const state = buildState({ tool_name: 'Bash', tool_input: {}, task_context: { current_task: prompt } }, true);

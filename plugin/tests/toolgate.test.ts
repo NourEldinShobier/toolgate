@@ -163,6 +163,32 @@ test('only a summary so far: it is sent as the goal, not as the task', async ($,
   expect(payload.task_context.session_goal.length).toBeLessThanOrEqual(1200)
 })
 
+test('a bare `toolgate` that the app cannot find is resolved through the login shell (desktop app, 0.17.1)', async ($, on) => {
+  const calls: string[][] = []
+  on('process.run', async (_$: unknown, e: { argv: readonly string[]; init?: { stdin?: string } }) => {
+    calls.push([...e.argv])
+    if (e.argv[0] === 'toolgate') throw new Error('spawn toolgate ENOENT')
+    if (e.argv[0] === '/bin/zsh') return ok('/opt/homebrew/bin/toolgate\n')
+    if (e.argv[0] === '/opt/homebrew/bin/toolgate' && e.argv[1] === 'version') return ok('0.17.1\n')
+    if (e.argv[0] === '/opt/homebrew/bin/toolgate' && e.argv[1] === 'decide') return ok(JSON.stringify({ verdict: 'allow', source: 'model' }))
+    return ok('')
+  })
+  on('session.messages', async () => value([{ role: 'user', text: 'list the files please, all of them, in this folder', toolUses: [] }]))
+  on('session.id', async () => value('session-1'))
+  on('session.cwd', async () => value('/Users/dev/project'))
+  on('command.register', async () => value(undefined))
+  on('session.start', async (_$: unknown, e: { cwd: string }) => ({ cwd: e.cwd }))
+  on('ui.status', async () => value(undefined))
+  on('ui.toast', async () => value(undefined))
+  on('settings.read', async () => value({}))
+  on('tool.check', async () => ({ decision: 'ask', reason: 'engine: mode' }))
+  await start($)
+  const verdict = await $.tool.check({ tool: 'Bash', input: { command: 'ls' } })
+  expect(verdict.decision).toBe('allow')
+  const decide = calls.find((c) => c[1] === 'decide')!
+  expect(decide[0]).toBe('/opt/homebrew/bin/toolgate')
+})
+
 test('an old CLI without the version command is named as such', async ($, on) => {
   const toasts: string[] = []
   on('process.run', async () => ({ value: { exitCode: 1, stdout: '', stderr: 'Unknown command "version"\n\ntoolgate — ...', isStdoutTruncated: false, isStderrTruncated: false } }))

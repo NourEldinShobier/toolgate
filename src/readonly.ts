@@ -34,11 +34,46 @@ export function isReadOnlyBash(command: string): boolean {
   if (!trimmed) return false;
   // Substitution and process substitution run something we are not classifying.
   if (/\$\(|`|<\(|>\(/.test(trimmed)) return false;
+  // Operators and redirections are only operators outside quotes: `grep "a|b" f | head` is two
+  // segments, not three (0.17.1; the 0.17.0 classifier split inside the quoted regex and missed
+  // about one in nine of the window's read-only greps).
+  const unquoted = blankQuotes(trimmed);
   // Any output redirection other than silencing/merging stderr writes a file.
-  if (/[<>]/.test(trimmed.replace(HARMLESS_REDIRECT, ' ').replace(/<<</g, ' '))) return false;
-  const segments = trimmed.split(/\n|&&|\|\||;|\|/).map((s) => s.trim()).filter(Boolean);
+  if (/[<>]/.test(unquoted.replace(HARMLESS_REDIRECT, ' ').replace(/<<</g, ' '))) return false;
+  const segments = splitUnquoted(trimmed, unquoted);
   if (segments.length === 0) return false;
   return segments.every(readOnlySegment);
+}
+
+/** The command with the inside of every quoted string replaced by spaces (same length, so offsets line up). */
+function blankQuotes(command: string): string {
+  let out = '';
+  let quote: string | undefined;
+  for (let i = 0; i < command.length; i++) {
+    const c = command[i]!;
+    if (quote) {
+      if (c === quote) { quote = undefined; out += c; }
+      else if (c === '\\' && quote === '"' && i + 1 < command.length) { out += '  '; i++; }
+      else out += c === '\n' ? '\n' : ' ';
+    } else if (c === '"' || c === "'") { quote = c; out += c; }
+    else if (c === '\\' && i + 1 < command.length) { out += '  '; i++; }
+    else out += c;
+  }
+  return out;
+}
+
+/** Split on newlines, `&&`, `||`, `;` and `|` found in the blanked copy; return the real text of each segment. */
+function splitUnquoted(command: string, unquoted: string): string[] {
+  const out: string[] = [];
+  let start = 0;
+  const re = /\n|&&|\|\||;|\|/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(unquoted)) !== null) {
+    out.push(command.slice(start, m.index));
+    start = m.index + m[0].length;
+  }
+  out.push(command.slice(start));
+  return out.map((s) => s.trim()).filter(Boolean);
 }
 
 function readOnlySegment(segment: string): boolean {

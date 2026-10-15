@@ -20,6 +20,8 @@
 
 Every closed-source harness ships a classifier like this. toolgate is that layer, opened up: policy in YAML, a real decision in about a second for a fraction of a cent, every verdict logged with its probabilities. Static rules and passthroughs cost ~90 ms and never load the AI SDK.
 
+In the month since Jev shipped, "gate the agent's tool calls with a decision model" went from an idea to a category: a lab teaches it, directories list dozens of implementations, a hosted service sells it, and a 50-line hook does a version of it. toolgate's position in that category is specific: the open, host-integrated implementation that **measures itself in public**, on declared windows of real sessions with a blind second labeler, and changes only on evidence ([Evaluation](#evaluation)). The thin gate will be everywhere; the track record, the session-state layer (the action ledger, confirmation memory, real task context), and one policy and audit format across hosts and decision models are what this project is for. [What 1.0 means](#what-10-means) says when it will call itself finished.
+
 It ships three ways: a **Claude Code mod** (in-process, from a plugin marketplace, keys in secure settings), the original **Claude Code `PreToolUse` hook**, and an **MCP proxy** that gates any MCP client (Cursor, Claude Desktop, your own agent). OpenAI/LangChain middleware is next.
 
 ## Quickstart
@@ -106,7 +108,7 @@ The `mock` backend is a deterministic heuristic for tests and offline dev. `type
 
 ## What leaves your machine
 
-Only the model path sends anything out, and only to the one provider your key selects (TypeSafe's API, OpenRouter, or your Vercel AI Gateway): the tool name, the tool input (secrets redacted, cut past 40 000 chars), the cwd, the permission mode, and the last three user prompts from the transcript (redacted; the latest ≤6 000 chars, the two before it ≤3 000 each; if the latest had to be cut, the verdict can be no better than `ask`) when `include_task_context` is on. All of these limits are in `limits:`. Static rules and passthroughs send nothing. Redaction catches the obvious shapes — `KEY=`, `Authorization:`, `--password`, known token prefixes — not every secret, so treat it as a courtesy, not a guarantee; Vercel's gateway offers a zero-data-retention option if you need one, and OpenRouter lets you set provider data policies per key.
+Only the model path sends anything out, and only to the one provider your key selects (TypeSafe's API, OpenRouter, or your Vercel AI Gateway): the tool name, the tool input (secrets redacted, cut past 40 000 chars), the cwd, the permission mode, and the last three user prompts from the transcript (redacted; the latest ≤6 000 chars, the two before it ≤3 000 each; a compaction summary is never sent as the prompt, and pasted logs inside a prompt are replaced by a marker) when `include_task_context` is on. Never sent: tool output, file contents the agent read, anything from calls the static rules or passthroughs decided. If the tool input had to be cut, the verdict can be no better than `ask`. All of these limits are in `limits:`. Static rules and passthroughs send nothing. Redaction catches the obvious shapes — `KEY=`, `Authorization:`, `--password`, known token prefixes — not every secret, so treat it as a courtesy, not a guarantee; Vercel's gateway offers a zero-data-retention option if you need one, and OpenRouter lets you set provider data policies per key.
 
 ## Audit log
 
@@ -180,7 +182,7 @@ const decision = await decide(
 // { verdict: 'deny', probabilities: { destructive: 0.91, ... }, ... }
 ```
 
-Backends are pluggable (`DecisionBackend`: `evaluate(state, questions) → answers`); TypeSafe direct, OpenRouter Decisions, Vercel AI Gateway, and mock ship built in. A local-model backend is welcome as a PR.
+Backends are pluggable (`DecisionBackend`: `evaluate(state, questions) → answers`); TypeSafe direct, OpenRouter Decisions, Vercel AI Gateway, and mock ship built in. Any backend that speaks the `/v1/systemone` wire format, including the open local models that copy it, is a configurable endpoint away; a local backend ships once it has been scored on the frozen sets, so the accuracy it costs is published next to the privacy it buys.
 
 ## Evaluation
 
@@ -212,6 +214,8 @@ Each runner prints the set's sha256 or name, every verdict with its probability 
 
 **Second window, 0.16.0.** Seven days, 1,633 decisions, policy untouched: **ask 15.6%** (was 20.9%), deny 0.2% (was 1.4%), zero `off_task` denies. The same reviewer labeled 407 items blind: toolgate stricter on 245, looser on 2; **0 denies and 1 ask among 150 sampled allows**, the ask about spending credits, not about a capability axis. A third of the remaining asks were a mechanics bug, not a judgment: a compaction summary arriving as a user prompt tripped the 6,000-character prompt cap and floored every call at ask until the next typed prompt. Remove those and the window sits at 10.7%. The reviewer also caught a redaction bug (an empty `KEY=` at end of line swallowed the next line). Both fixes, plus read-only calls never asking on `off_task` alone and a per-session confirmation memory, are 0.17.0. Report: `docs/usage-2026-10-11.md`.
 
+**Third window, 0.17.0.** Declared before it opened and closed by its own rule after one day (318 decisions): **ask 13.8%** (20.9% → 15.6% → 13.8%), one deny, zero permissive misses; the days around it run 17.5%. The mechanical asks are gone (truncation floor fired once, not 82 times); what remains is `off_task` on investigative writes against reaction prompts, which two blind labelings have called noise, and exfiltration asks on the author's own services with `trusted_hosts` unset. Replayed, "off_task alone asks only when a capability axis is at least 0.40" takes the window to 6.2%; it ships as 0.18 after a frozen-set run, with its cost named (no spending axis). Report: `docs/usage-2026-10-15.md`.
+
 **Latency from a laptop.** The measurement window ran at 1,060 ms p50 / 1,216 ms p90 (1,368 calls, direct API). A same-minute side-by-side on 2026-09-27 put the direct API at 742–878 ms (median 782) and OpenRouter's Decisions API at 724–813 ms after a 1.1 s cold first call (median 724): equivalent routes. The benchmark runs on 2026-09-28 ran at 350–600 ms per call with full ledger state attached. Earlier: direct 1208 ms, Vercel Gateway 1324 ms (the Gateway adds ~100 ms). TypeSafe quotes 70–500 ms; the low end has not been observed from outside their infrastructure. Static rules take ~90 ms and never call the model.
 
 
@@ -231,11 +235,11 @@ These are small constructed sets targeting specific failure categories, not a ge
 
 ## Roadmap
 
-Done, in order: frozen-set evaluation (0.5), real-usage numbers and the fixes they forced (0.6), MCP proxy (0.7), `trusted_hosts` / `trusted_tools` (0.8–0.9.1), key-aware redaction and the deny floor (0.9.2), the action ledger (0.10), long-session context and `off_task` capped at ask (0.11), OpenRouter route (0.12), two proxy fail-open fixes from an outside code review (0.12.1 / 0.13.1), five more execution shapes and the unavailable-ledger floor (0.13), syntax checks as references and the ledger-aware exfiltration wording (0.14), `make` in the ledger (0.14.1), content is not action (0.15), the Claude Code mod (0.16), the second window's fixes: floor on input only, compaction summaries as context, read-only calls never asked on `off_task` alone, confirmation memory, `host` in the audit row (0.17). Each one is validated on a frozen set or a measurement window, listed under Evaluation.
+Done, in order: frozen-set evaluation (0.5), real-usage numbers and the fixes they forced (0.6), MCP proxy (0.7), `trusted_hosts` / `trusted_tools` (0.8–0.9.1), key-aware redaction and the deny floor (0.9.2), the action ledger (0.10), long-session context and `off_task` capped at ask (0.11), OpenRouter route (0.12), two proxy fail-open fixes from an outside code review (0.12.1 / 0.13.1), five more execution shapes and the unavailable-ledger floor (0.13), syntax checks as references and the ledger-aware exfiltration wording (0.14), `make` in the ledger (0.14.1), content is not action (0.15), the Claude Code mod (0.16), the second window's fixes: floor on input only, compaction summaries as context, read-only calls never asked on `off_task` alone, confirmation memory, `host` in the audit row (0.17), the third window's: quoted operators in the read-only classifier, the mod finding the CLI from a desktop-app launch, the default model pinned (0.17.1). Each one is validated on a frozen set or a measurement window, listed under Evaluation.
 
 Next, ranked by what the criticism and the data say matters most:
 
-1. **A third measurement window on 0.17.0, mod host** — the second window replayed through 0.17.0 with its recorded probabilities comes out at 8.6% ask (from 15.6%); the replay cannot re-score calls that were judged against a compaction summary, so the real number is the third window's. Target: under 10% ask with the capability axes unchanged.
+1. **`off_task` asks only when something could change (0.18).** Two blind labelings and three windows agree that off-task-only asks are noise for a solo developer; the rule "off_task alone raises an ask only when a capability axis is at least 0.40" replays to 6.2% on the third window and about 5.5% on the second. It touches the lattice, so one frozen-set run first. Its named cost: calls that spend money without being asked have low capability scores and would pass; toolgate has no spending axis.
 2. **Deleting a file this session wrote is housekeeping.** The second window's remaining destructive asks are one command: remove a preview page and a scratch component the agent itself created, rebuild, commit. The ledger already knows those paths were written this session; a `deletes_artifact_written_this_session` fact beside the destructive question would let the model weigh that. A wording change, so it gets a frozen-set case first (0.18 candidate).
 3. **Ledger coverage for writes made from Bash** — `echo > x`, heredocs, `tee`, `sed -i`, `npm pkg set`. Set 6 case 20 and both outside reviews name this; it is the one ledger gap left that a real session hits.
 4. **Second-user data.** Every evaluation so far is one machine. An audit line from anyone else's session is worth more than another frozen set; `toolgate audit --stats` output in an issue is the ask.
@@ -250,6 +254,19 @@ Next, ranked by what the criticism and the data say matters most:
 13. **Works alongside, not inside.** Jev Belay (done-claim verification on the Stop hook) and toolgate gate different moments of the same session and do not overlap; a "works alongside" note belongs in the README once either has been run next to the other for a week.
 
 **How this relates to LangChain's Jev integration.** LangChain ships an official `AutoMode` middleware that does the same job — check each tool call with Jev, block the risky ones — for LangChain agents. toolgate is the same pattern for the hosts that middleware does not reach: Claude Code's `PreToolUse` hook and any MCP client through the proxy. On top of the pattern it adds YAML policy, the action ledger, and the published measurements above. And on the argument that a few lines of regex do this job for free: frozen set 6 is the direct test — a regex cannot tell a commit message that mentions `rm -rf` from running it, and the inert sides of that set score ≤ 0.32 while the action sides score 0.91–0.98.
+
+## What 1.0 means
+
+toolgate is pre-1.0 and says so. 1.0 is not a feature list; it is a bar, stated here so "still young" has a visible end:
+
+1. **Three consecutive declared measurement windows** of real sessions at or under 10% ask with zero permissive misses on a blind second labeling, on the same policy, each written up before the next opens. (Three windows so far: 20.9%, 15.6%, 13.8%.)
+2. **Audit data from at least one machine that is not the maintainer's.** `toolgate audit --stats` output from anyone else's sessions, aggregates only. The command to make that a one-liner is next.
+3. **The frozen sets hold across decision models**: two Jev versions, and at least one backend that is not TypeSafe's hosted model, with every delta published in one table. The default model is pinned and moves only after such a run.
+4. **Two hosts beyond the Claude Code hook** gating real sessions (the MCP proxy and the mod exist; an OpenCode hook is in review), with the engine unchanged across them.
+5. **Stability promises**: the policy schema, the audit row, and the library API frozen under semver; a deprecation policy for anything in them.
+6. **A privacy option that keeps everything on the machine**, scored (criterion 3), not just offered.
+
+When those hold, 1.0 ships with a single write-up of what measuring a tool-call gate on several thousand real decisions taught, and the measurement protocol itself, so anyone can run the same windows on their own gate.
 
 ## Threat model
 

@@ -5,6 +5,8 @@ import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { toHookOutput } from '../src/hook.js';
 import { buildState, redact, redactInput, redactedInputText } from '../src/state.js';
+import { DEFAULT_JEV_MODEL, makeBackend } from '../src/hook.js';
+import { defaultPolicy } from '../src/policy.js';
 
 const CLI = join(__dirname, '..', 'dist', 'cli.js');
 
@@ -193,5 +195,19 @@ describe('hook end-to-end (built CLI)', () => {
   it('malformed policy → ask, exit 0 (never a silent allow)', () => {
     const { stdout } = runHook(JSON.stringify({ tool_name: 'Bash', tool_input: { command: 'ls' } }), 'thresholds: [broken\n');
     expect(JSON.parse(stdout).hookSpecificOutput.permissionDecision).toBe('ask');
+  });
+});
+
+describe('the default model is pinned (0.17.1)', () => {
+  it('typesafe resolves to a specific Jev version, never the floating alias', () => {
+    const prev = process.env.TYPESAFE_API_KEY;
+    process.env.TYPESAFE_API_KEY = 'ts-test';
+    try {
+      const b = makeBackend(defaultPolicy());
+      expect(b.name).toBe(`typesafe:${DEFAULT_JEV_MODEL}`);
+      expect(DEFAULT_JEV_MODEL).toMatch(/^jev-\d+\.\d+\.\d+$/);
+    } finally {
+      if (prev === undefined) delete process.env.TYPESAFE_API_KEY; else process.env.TYPESAFE_API_KEY = prev;
+    }
   });
 });

@@ -26,6 +26,9 @@ class LazyGatewayBackend implements DecisionBackend {
   }
 }
 
+/** The Jev version every published number was measured on. Moved deliberately, after a frozen-set run. */
+export const DEFAULT_JEV_MODEL = 'jev-1.13.0';
+
 /** Which real backend `auto` resolves to, from the environment. */
 export type Provider = 'typesafe' | 'openrouter' | 'gateway' | 'mock';
 
@@ -64,8 +67,10 @@ export function makeBackend(policy: Policy, override?: string): DecisionBackend 
   }
   const model = policy.backend.model === 'auto' ? undefined : policy.backend.model;
   if (provider === 'mock') return new MockBackend();
+  // Pinned, not `jev-latest` (0.17.1): every published threshold was measured on 1.13.0, and TypeSafe
+  // moves the alias on its own schedule. A new model version is adopted here, after a frozen-set run.
   if (provider === 'gateway') return new LazyGatewayBackend(model ?? 'typesafe-ai/jev');
-  if (provider === 'typesafe') return new LazyTypeSafeBackend(model ?? 'jev-latest');
+  if (provider === 'typesafe') return new LazyTypeSafeBackend(model ?? DEFAULT_JEV_MODEL);
   if (provider === 'openrouter') return new LazyOpenRouterBackend(model ?? 'typesafe/jev-1.13');
   throw new Error(`unknown backend "${provider}" (expected auto | typesafe | openrouter | gateway | mock)`);
 }

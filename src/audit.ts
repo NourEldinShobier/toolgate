@@ -51,6 +51,7 @@ export function writeAudit(policy: Policy, input: HookInput, decision: Decision,
       input: policy.audit.log_input ? redactedInputText(input.tool_input).slice(0, MAX_LOGGED_INPUT) : undefined,
       input_chars: matchText(input.tool_input).length,
       input_truncated: truncatedInput(decision) || undefined,
+      read_only: decision.readOnly || undefined,
       // What the model was told the task was — the key to diagnosing off_task and authorized.
       task: taskSummary(decision, policy.audit.log_input),
       verdict: decision.verdict,

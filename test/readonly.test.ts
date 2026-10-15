@@ -30,6 +30,13 @@ describe('isReadOnlyBash: every segment must only read', () => {
     'which ffmpeg; ffprobe -version 2>/dev/null | head -1 || true',
     'du -sh node_modules 2>/dev/null',
     'test -f .env && echo yes || echo no',
+    // 0.17.1: operators inside quotes are not operators (the window's missed greps)
+    'grep -n -i "delete.*account|deleteAccount" src/App.jsx | head -5',
+    "grep -rn 'REFERRER_SIGNUP_REWARD =|REFERRED_BONUS =' api/apply-referral.js 2>/dev/null | head; grep -rln 'a|b' api src",
+    'grep -rhoE "from\\(([a-z_]*(purchase|payment|order)[a-z_]*)" api src | sort | uniq -c',
+    'cd ~/Desktop/site && grep -n "Product Hunt. Together|grew" -A3 src/templates/Home.tsx | head -12',
+    'grep -n "credits|price|amount" api/create-checkout-session.js | head -25',
+    'echo "a > b"',
   ];
   const no = [
     '',
@@ -64,6 +71,9 @@ describe('isReadOnlyBash: every segment must only read', () => {
     'export X=1; ./run.sh',
     'env FOO=bar node script.js',
     'diff <(ls a) <(ls b)',
+    'grep -n "foo" file.txt > out.txt',
+    "grep 'x' f; rm g",
+    'echo "safe" ; echo unsafe > f',
   ];
   for (const c of yes) it(`read-only: ${JSON.stringify(c)}`, () => expect(isReadOnlyBash(c)).toBe(true));
   for (const c of no) it(`not read-only: ${JSON.stringify(c)}`, () => expect(isReadOnlyBash(c)).toBe(false));

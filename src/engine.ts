@@ -240,7 +240,7 @@ export async function decide(input: HookInput, policy: Policy, backend: Decision
     verdict = 'deny';
     reason = `${reason} (no one to ask in ${input.permission_mode} mode, so denied)`;
   }
-  return { verdict, reason, source, probabilities, capabilities, capability_probs: capabilities ? capabilityProbs : undefined, latencyMs, setupMs, state };
+  return { verdict, reason, source, probabilities, capabilities, capability_probs: capabilities ? capabilityProbs : undefined, latencyMs, setupMs, state, readOnly: readOnly || undefined };
 }
 
 function shortPath(p: string): string {

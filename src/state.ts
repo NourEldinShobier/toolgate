@@ -36,9 +36,15 @@ export function isCompactionSummary(text: string): boolean {
   return COMPACTION_SUMMARY.test(text);
 }
 
+const TASK_NOTIFICATION = /<task-notification>[\s\S]*?<\/task-notification>/g;
+
 /** A pasted log or table is material the person attached, not what they asked for: keep the typed part. */
 export function withoutPastedContent(text: string): string {
-  return text.replace(PASTED_CONTENT, '[pasted content omitted]').replace(/<artifact-content-authored-by-others\/>\s*/g, '').trim();
+  return text
+    .replace(PASTED_CONTENT, '[pasted content omitted]')
+    .replace(TASK_NOTIFICATION, '[task notification omitted]')
+    .replace(/<artifact-content-authored-by-others\/>\s*/g, '')
+    .trim();
 }
 
 /**
