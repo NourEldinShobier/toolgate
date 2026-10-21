@@ -56,7 +56,8 @@
     "smoke": "npm run build && bash scripts/smoke.sh",
     "release:verified": "npm run check && bash scripts/smoke.sh && npm publish",
     "prepublishOnly": "npm run build && vitest run",
-    "test:mod": "claude plugin validate ./plugin && claude plugin test ./plugin"
+    "test:mod": "claude plugin validate ./plugin && claude plugin test ./plugin",
+    "prepare": "npm run build"
   },
   "dependencies": {
     "ai": "^7.0.0",
