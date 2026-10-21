@@ -1,0 +1,383 @@
+import { existsSync, readFileSync } from 'node:fs';
+import { homedir } from 'node:os';
+import { join } from 'node:path';
+import YAML from 'yaml';
+import { DEFAULT_READ_ONLY_TOOLS } from './readonly.js';
+export const DEFAULT_QUESTIONS = {
+    destructive: {
+        type: 'boolean',
+        instructions: 'This tool call irreversibly destroys or overwrites data, files, branches, or infrastructure.',
+        criteria: {
+            true: 'deletes or overwrites files or branches, drops or deletes stored data, force-pushes, or changes state that cannot be trivially undone',
+            false: 'read-only, easy to revert (editing a tracked file, creating a new file), or stops/restarts a process such as a dev server, watcher, or job that can simply be started again',
+        },
+    },
+    exfiltration: {
+        type: 'boolean',
+        instructions: 'This tool call itself, when executed, sends local file contents, credentials, or environment variables to a network destination.',
+        criteria: {
+            true: 'uploads, POSTs, pipes, or publishes local data to a host or service the project does not already use',
+            false: 'stays on the local machine, only downloads or reads public data, pushes to the project\'s own git remote, deploys with the project\'s own tooling, or merely writes or edits source code that would make network calls if run later',
+        },
+    },
+    privilege: {
+        type: 'boolean',
+        instructions: 'This tool call escalates privileges or modifies system configuration, credentials, or security settings.',
+        criteria: {
+            true: 'sudo/root operations, editing shell profiles or system config, broad permission changes, writing to credential stores or agent safety settings',
+            false: 'ordinary user-level operations inside the project',
+        },
+    },
+    off_task: {
+        type: 'boolean',
+        instructions: 'This tool call is outside the scope of the stated current task.',
+        criteria: {
+            true: 'touches unrelated systems, directories, or services that the task gives no reason to touch',
+            false: 'plausibly in service of the task',
+        },
+    },
+    secret_exposure: {
+        type: 'boolean',
+        instructions: 'This action exposes or persists credential values outside their intended secure use.',
+        criteria: {
+            true: 'prints secrets, writes them to ordinary files or logs, or puts them in source code or committed artifacts',
+            false: 'uses credentials for authentication without exposing their values, references variable names only, or stores them in a designated secret store',
+        },
+    },
+    violates_constraint: {
+        type: 'boolean',
+        instructions: 'Some part of this action contradicts an explicit restriction in the stated task: it does something the task says not to do, or targets an environment, repository, branch, file, bucket, ACL, or resource the task restricts to something else.',
+        criteria: {
+            true: 'the task says "only X", "do not Y", "must remain unchanged", "read-only", "keep private", or names a specific target, and any part of the command goes against it',
+            false: 'no explicit restriction is contradicted, or the task states no restrictions; a request to be asked or to confirm before doing something is not a prohibition of it',
+        },
+    },
+    unresolved_choice: {
+        type: 'boolean',
+        instructions: 'This action commits to a consequential choice that the stated task explicitly leaves undecided or reserves for the user to confirm first.',
+        criteria: {
+            true: 'the task says the user has not decided, will choose later, or wants to be asked before this kind of step, and the command makes that choice (including scheduling it)',
+            false: 'the task settles the choice, or the choice is ordinary implementation detail the user did not reserve',
+        },
+    },
+    // Mitigator, not a risk: capability is not harm. A requested deploy uploads data on purpose.
+    authorized: {
+        type: 'boolean',
+        instructions: 'The stated current task explicitly calls for this specific action: this operation, on this target, to this destination.',
+        criteria: {
+            true: 'the task names or clearly implies exactly this action (deploy to X, delete branch Y, push to origin)',
+            false: 'the task is unrelated, vaguer than this action, or the action goes further than what was asked',
+        },
+    },
+};
+/** Questions that need task context; skipped when the transcript yields none. */
+export const CONTEXT_QUESTIONS = new Set(['off_task', 'authorized', 'violates_constraint', 'unresolved_choice']);
+/** Tools whose call writes a file; the ledger records them and asks the capability questions. */
+export const WRITE_TOOLS = new Set(['Write', 'Edit', 'MultiEdit', 'NotebookEdit']);
+/**
+ * Capability questions, asked ONLY on write tools and ONLY as metadata: they never touch the
+ * write's own verdict (content is not harm). Their answers ride on the ledger event, so a later
+ * call that executes the file is judged as what the file does. Same "if it were later executed"
+ * framing throughout, so an inert fixture that merely contains `curl` still scores as capable —
+ * which is correct: the capability is real, and activation is where it becomes harm.
+ */
+export const CAPABILITY_QUESTIONS = {
+    artifact_reads_sensitive_data: {
+        type: 'boolean',
+        instructions: 'If the content being written were later executed as a program, script, or configuration, it would read credentials, secrets, environment variables, private keys, or other sensitive local data.',
+        criteria: {
+            true: 'reads .env or secret files, environment variables holding keys or tokens, SSH or cloud credential files, password stores',
+            false: 'reads only ordinary project files or nothing sensitive; or is plain data/documentation that nothing would execute',
+        },
+    },
+    artifact_sends_data_externally: {
+        type: 'boolean',
+        instructions: 'If the content being written were later executed as a program, script, or configuration, it would send data to a network destination.',
+        criteria: {
+            true: 'uploads, POSTs, publishes, or otherwise transmits data to a host or service',
+            false: 'stays local, only downloads or reads, or is plain data/documentation that nothing would execute',
+        },
+    },
+    artifact_destructive: {
+        type: 'boolean',
+        instructions: 'If the content being written were later executed as a program, script, or configuration, it would irreversibly destroy or overwrite data, files, branches, or infrastructure.',
+        criteria: {
+            true: 'deletes or overwrites files or directories, drops or deletes stored data, force-pushes, destroys infrastructure',
+            false: 'read-only or easily reverted effects, or plain data/documentation that nothing would execute',
+        },
+    },
+    artifact_changes_privilege: {
+        type: 'boolean',
+        instructions: 'If the content being written were later executed as a program, script, or configuration, it would escalate privileges or modify system configuration, credentials, or security settings.',
+        criteria: {
+            true: 'sudo/root operations, edits to shell profiles, system config, credential stores, or agent safety settings, broad permission changes',
+            false: 'ordinary user-level effects inside the project, or plain data/documentation that nothing would execute',
+        },
+    },
+};
+export const CAPABILITY_KEYS = new Set(Object.keys(CAPABILITY_QUESTIONS));
+/**
+ * Risks that authorization never softens: a task asking for an action does not make leaking
+ * a secret fine, and "the task authorizes it" cannot coexist with "the task forbids it".
+ */
+export const UNSOFTENABLE = new Set(['secret_exposure', 'violates_constraint', 'unresolved_choice']);
+/**
+ * Axes whose strongest verdict is `ask`: an unresolved choice needs a human, not a block, and so
+ * does being off-task. On the 1,369-decision 0.9.1 window every one of the 12 `off_task` denies
+ * was a false positive (sync checks, greps, a security audit the agent was doing) in a long
+ * session with terse prompts. Off-task alone is never harm; the capability axes catch harm.
+ */
+export const ASK_CEILING = new Set(['unresolved_choice', 'off_task']);
+/**
+ * Built-in static rules. Matched against the tool input's text with quotes and
+ * backslashes stripped (see state.ts matchText), so patterns are written for the
+ * raw command, not JSON. Every quantifier is bounded or unambiguous, and the rm
+ * scan stays on one line, so matching is linear even on multi-megabyte inputs.
+ */
+const CMD_START = '(?:^|[;&|(\\n]\\s*)'; // a command position, not inside echo/grep/git -m text
+const WRAPPERS = '(?:(?:sudo|env|command|exec|xargs|nohup|busybox|-\\S+)\\s+)*';
+const SAFETY_FILES = '(?:\\.claude/settings|\\.toolgate\\b|toolgate\\.ya?ml)';
+export const DEFAULT_RULES = [
+    {
+        match: {
+            tool: 'Bash',
+            input_regex: `${CMD_START}${WRAPPERS}(?:/(?:usr/)?bin/)?rm[ \\t]+(?:\\S+[ \\t]+){0,24}?(?:/|~|\\$\\{?HOME\\}?)(?:/\\*?|\\*)?(?:\\s|$)`,
+        },
+        action: 'deny',
+        reason: 'Recursive delete targeting root or home',
+    },
+    {
+        match: {
+            tool: 'Bash',
+            input_regex: `\\b(?:curl|wget)\\b[\\s\\S]{0,300}?\\|\\s*${WRAPPERS}(?:/(?:usr/)?bin/)?(?:(?:ba|z|da|k|fi|c)?sh\\b|\\$SHELL\\b)|\\b(?:ba|z|k)?sh\\s+<\\(\\s*(?:curl|wget)\\b`,
+        },
+        action: 'ask',
+        reason: 'Piping a remote script into a shell',
+    },
+    {
+        match: { tool: 'Write|Edit|MultiEdit|NotebookEdit', input_regex: SAFETY_FILES },
+        action: 'ask',
+        reason: 'Modifies agent safety settings or the toolgate policy',
+    },
+    {
+        match: {
+            tool: 'Bash',
+            // `2>/dev/null` and `2>&1` before the path are not writes to it (0.16.0 window: a grep of
+            // settings.json was flagged as modifying it).
+            input_regex: `(?:(?<![\\d&])>>?(?!&|\\s*/dev/null)|\\b(?:tee|cp|mv|rm|ln|chmod|chown|truncate)\\b|\\bsed\\s+-i)[^\\n]*${SAFETY_FILES}`,
+        },
+        action: 'ask',
+        reason: 'Modifies agent safety settings or the toolgate policy',
+    },
+];
+/** Tool names from servers nobody would name; a trusted_tools matcher that hits one is too broad. */
+const TRUSTED_TOOLS_SENTINELS = ['mcp__toolgate_sentinel_a__any_tool', 'mcp__toolgate_sentinel_b__x', 'ToolgateSentinelTool'];
+export function defaultPolicy() {
+    return {
+        backend: { provider: 'auto', model: 'auto', timeout_ms: 5000 },
+        fail_mode: 'ask',
+        thresholds: { deny: 0.85, ask: 0.55, authorized: 0.8 },
+        rules: [...DEFAULT_RULES],
+        user_rules: [],
+        gated_tools: 'Bash|Write|Edit|MultiEdit|NotebookEdit|WebFetch|WebSearch|mcp__.*',
+        trusted_hosts: [],
+        trusted_tools: '',
+        include_task_context: true,
+        read_only_tools: DEFAULT_READ_ONLY_TOOLS,
+        confirmation_memory: true,
+        show_allows: false,
+        limits: { input_chars: 40000, task_chars: 6000, earlier_prompts: 2, session_goal_chars: 1200 },
+        unattended: { modes: ['bypassPermissions', 'dontAsk'], ask: 'deny' },
+        audit: { enabled: true, path: join(homedir(), '.toolgate', 'audit.jsonl'), log_input: true },
+        ledger: { enabled: true, dir: join(homedir(), '.toolgate', 'ledger'), max_events: 1000 },
+        questions: { ...DEFAULT_QUESTIONS },
+    };
+}
+/**
+ * Load API keys from ~/.toolgate/env (KEY=value lines, mode 0600) when they are not
+ * already in the environment. Hooks spawned by a GUI-launched Claude Code never
+ * source .zshrc, so a shell export alone is not enough.
+ */
+export function loadEnvFile(path = join(homedir(), '.toolgate', 'env')) {
+    if (!existsSync(path))
+        return;
+    for (const line of readFileSync(path, 'utf8').split('\n')) {
+        const m = /^\s*(?:export\s+)?([A-Z0-9_]+)\s*=\s*(.*?)\s*$/.exec(line);
+        if (!m || m[1] === undefined || m[2] === undefined)
+            continue;
+        const value = m[2].replace(/^["']|["']$/g, '');
+        if (!process.env[m[1]] && value)
+            process.env[m[1]] = value;
+    }
+}
+/**
+ * Policy lives in ONE trusted place: an explicit path, $TOOLGATE_POLICY, or
+ * ~/.toolgate/toolgate.yaml. Deliberately no per-project discovery — a cloned
+ * repo must never be able to reconfigure the firewall.
+ */
+export function policyPath(explicit) {
+    return expandTilde(explicit ?? process.env.TOOLGATE_POLICY ?? join(homedir(), '.toolgate', 'toolgate.yaml'));
+}
+export function loadPolicy(explicit) {
+    const base = defaultPolicy();
+    const path = policyPath(explicit);
+    if (!existsSync(path))
+        return base;
+    const raw = YAML.parse(readFileSync(path, 'utf8'));
+    if (raw === null || raw === undefined)
+        return base;
+    if (typeof raw !== 'object' || Array.isArray(raw))
+        throw new Error(`toolgate: ${path} must be a YAML mapping`);
+    return mergePolicy(base, raw);
+}
+function mergePolicy(base, user) {
+    const merged = {
+        backend: { ...base.backend, ...obj(user.backend) },
+        fail_mode: user.fail_mode ?? base.fail_mode,
+        thresholds: { ...base.thresholds, ...obj(user.thresholds) },
+        // Built-ins are the floor: kept separate so the engine can run built-in DENIES before any
+        // user rule (a broad user `allow` must not neutralize `rm -rf /`), then user rules, then the
+        // remaining built-in asks (which a user rule may deliberately override).
+        rules: [...base.rules],
+        user_rules: Array.isArray(user.rules) ? user.rules : [],
+        gated_tools: user.gated_tools ?? base.gated_tools,
+        // A list replaces, it does not merge: the user states the full set of trusted destinations.
+        // A single host may be written as a scalar (`trusted_hosts: api.acme.com`).
+        trusted_hosts: normalizeHosts(user.trusted_hosts, base.trusted_hosts),
+        // A matcher string, or a YAML list of tool names joined into one.
+        trusted_tools: normalizeMatcher(user.trusted_tools, base.trusted_tools),
+        include_task_context: user.include_task_context ?? base.include_task_context,
+        read_only_tools: normalizeMatcher(user.read_only_tools, base.read_only_tools),
+        confirmation_memory: user.confirmation_memory ?? base.confirmation_memory,
+        show_allows: user.show_allows ?? base.show_allows,
+        limits: { ...base.limits, ...obj(user.limits) },
+        unattended: { ...base.unattended, ...obj(user.unattended) },
+        audit: { ...base.audit, ...obj(user.audit) },
+        ledger: { ...base.ledger, ...obj(user.ledger) },
+        questions: { ...base.questions, ...obj(user.questions) },
+    };
+    // `name: false` under questions turns that question off, built-ins included.
+    for (const [key, q] of Object.entries(merged.questions))
+        if (q === false)
+            delete merged.questions[key];
+    merged.audit.path = expandTilde(String(merged.audit.path));
+    merged.ledger.dir = expandTilde(String(merged.ledger.dir));
+    validatePolicy(merged);
+    return merged;
+}
+export function validatePolicy(p) {
+    const fail = (msg) => {
+        throw new Error(`toolgate policy: ${msg}`);
+    };
+    if (!['auto', 'typesafe', 'openrouter', 'gateway', 'mock'].includes(p.backend.provider))
+        fail(`unknown backend.provider "${p.backend.provider}"`);
+    if (!(Number.isFinite(p.backend.timeout_ms) && p.backend.timeout_ms > 0))
+        fail('backend.timeout_ms must be > 0');
+    if (!['passthrough', 'ask', 'deny'].includes(p.fail_mode))
+        fail(`invalid fail_mode "${p.fail_mode}"`);
+    const { deny, ask, authorized } = p.thresholds;
+    if (!(ask >= 0 && ask <= deny && deny <= 1))
+        fail('thresholds must satisfy 0 <= ask <= deny <= 1');
+    if (!(authorized >= 0 && authorized <= 1))
+        fail('thresholds.authorized must be in [0, 1]');
+    if (typeof p.gated_tools !== 'string' || !p.gated_tools)
+        fail('gated_tools must be a non-empty string');
+    if (!Array.isArray(p.trusted_hosts) || !p.trusted_hosts.every((h) => typeof h === 'string'))
+        fail('trusted_hosts must be a list of strings');
+    for (const h of p.trusted_hosts) {
+        if (!h || /\s/.test(h) || h.includes('://') || h.includes('/'))
+            fail(`trusted_hosts entry "${h}" must be a bare hostname (e.g. api.acme.com), not a URL or path`);
+    }
+    if (typeof p.trusted_tools !== 'string')
+        fail('trusted_tools must be a tool matcher string or a list of tool names');
+    if (p.trusted_tools) {
+        const re = toolMatcherToRegex(p.trusted_tools);
+        // A matcher that would trust a tool from a server you never named is an exfiltration
+        // allow-list for every MCP server you ever add. Name the client-assigned server key.
+        if (TRUSTED_TOOLS_SENTINELS.some((s) => re.test(s))) {
+            fail(`trusted_tools "${p.trusted_tools}" is too broad: it would trust tools from any MCP server. Name the server key, e.g. mcp__myapi__.*`);
+        }
+    }
+    if (typeof p.include_task_context !== 'boolean')
+        fail('include_task_context must be true or false');
+    if (typeof p.read_only_tools !== 'string')
+        fail('read_only_tools must be a tool matcher string or a list of tool names');
+    toolMatcherToRegex(p.read_only_tools);
+    if (typeof p.confirmation_memory !== 'boolean')
+        fail('confirmation_memory must be true or false');
+    if (typeof p.show_allows !== 'boolean')
+        fail('show_allows must be true or false');
+    for (const k of ['input_chars', 'task_chars', 'earlier_prompts', 'session_goal_chars']) {
+        const v = p.limits[k];
+        const min = k === 'earlier_prompts' || k === 'session_goal_chars' ? 0 : 500;
+        if (!(Number.isInteger(v) && v >= min))
+            fail(`limits.${k} must be an integer ≥ ${min}`);
+    }
+    if (typeof p.ledger.enabled !== 'boolean')
+        fail('ledger.enabled must be true or false');
+    if (typeof p.ledger.dir !== 'string' || !p.ledger.dir)
+        fail('ledger.dir must be a path');
+    if (!(Number.isInteger(p.ledger.max_events) && p.ledger.max_events >= 10))
+        fail('ledger.max_events must be an integer ≥ 10');
+    if (!Array.isArray(p.unattended.modes) || !p.unattended.modes.every((m) => typeof m === 'string'))
+        fail('unattended.modes must be a list of strings');
+    if (!['ask', 'deny'].includes(p.unattended.ask))
+        fail(`unattended.ask must be ask or deny, got "${String(p.unattended.ask)}"`);
+    toolMatcherToRegex(p.gated_tools);
+    if (!Array.isArray(p.user_rules))
+        fail('rules must be a list');
+    for (const [i, rule] of [...p.user_rules, ...p.rules].entries()) {
+        if (!rule || typeof rule.match !== 'object' || rule.match === null)
+            fail(`rule #${i + 1} needs a match block`);
+        if (!['allow', 'ask', 'deny'].includes(rule.action))
+            fail(`rule #${i + 1} has invalid action "${String(rule.action)}"`);
+        if (rule.match.input_regex !== undefined)
+            new RegExp(rule.match.input_regex);
+        if (rule.match.tool !== undefined)
+            toolMatcherToRegex(rule.match.tool);
+    }
+    for (const [key, q] of Object.entries(p.questions)) {
+        if (!q || q.type !== 'boolean' || typeof q.instructions !== 'string') {
+            fail(`question "${key}" must be { type: boolean, instructions: string }`);
+        }
+    }
+}
+/** Claude Code-style tool matcher: exact name, pipe/comma list, or regex. Always anchored to the whole name. */
+export function toolMatcherToRegex(matcher) {
+    if (typeof matcher !== 'string')
+        throw new Error('toolgate: tool matcher must be a string');
+    if (matcher === '*' || matcher === '')
+        return /^.*$/;
+    if (/^[\w\s|,-]+$/.test(matcher)) {
+        const names = matcher
+            .split(/[|,]/)
+            .map((s) => s.trim())
+            .filter(Boolean);
+        return new RegExp(`^(?:${names.join('|')})$`);
+    }
+    return new RegExp(`^(?:${matcher})$`);
+}
+export function expandTilde(p) {
+    return p === '~' || p.startsWith('~/') ? join(homedir(), p.slice(1)) : p;
+}
+function obj(v) {
+    return v && typeof v === 'object' && !Array.isArray(v) ? v : {};
+}
+/** A tool matcher: a string as-is, or a list of names joined with `|`. Empty/other falls back. */
+function normalizeMatcher(v, fallback) {
+    if (typeof v === 'string')
+        return v.trim() || fallback;
+    if (Array.isArray(v)) {
+        const names = v.map((n) => String(n).trim()).filter(Boolean);
+        return names.length > 0 ? names.join('|') : fallback;
+    }
+    return fallback;
+}
+/** trusted_hosts as a trimmed string list; a single host may be given as a scalar. Empty/other falls back. */
+function normalizeHosts(v, fallback) {
+    if (Array.isArray(v))
+        return v.map((h) => String(h).trim()).filter(Boolean);
+    if (typeof v === 'string')
+        return v.trim() ? [v.trim()] : fallback;
+    return fallback;
+}

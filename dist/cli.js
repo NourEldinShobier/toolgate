@@ -1,0 +1,443 @@
+#!/usr/bin/env node
+import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { homedir, tmpdir } from 'node:os';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { parseArgs } from 'node:util';
+import { KEY_ENV_VARS, runDecide, runHook, runPost, makeBackend, resolveProvider } from './hook.js';
+import { runMcp } from './mcp.js';
+import { loadEnvFile, loadPolicy, policyPath } from './policy.js';
+import { decide } from './engine.js';
+import { POST_EVENTS, SETTINGS_PATH, hookCommand, hookSelfTest, installHook, installedHookCommands, installedPostEvents, readSettings, settingsSnippet, writeSettings } from './install.js';
+const HELP = `toolgate — a calibrated tool-call firewall for AI agents
+
+Usage:
+  toolgate hook [--policy <path>] [--backend typesafe|openrouter|gateway|mock]
+      Run as a Claude Code PreToolUse hook (JSON in on stdin).
+
+  toolgate check --tool <name> --input=<json|string> [--task <text>]... [--backend typesafe|openrouter|gateway|mock]
+      Dry-run a tool call against the policy and print the decision and the exact state sent.
+      --task supplies user prompts (repeatable, oldest first; the last is the current task)
+      so the context questions are asked.
+
+  toolgate mcp [--gate <regex>] [--on-ask block|allow] [--trusted] [--backend ...] -- <server-cmd> [args...]
+      Sit between an MCP client and one downstream MCP server, gating every tools/call.
+      Allow forwards it; deny (and ask, by default) returns a tool error with the reason.
+      Supply a task with TOOLGATE_TASK or ~/.toolgate/task so the context questions apply.
+      --trusted: "I launched this server and accept its destinations" — its advertised tools
+      are treated as your own service (exfiltration axis only; everything else gated as usual).
+      Trust, from --trusted or the policy's trusted_tools, is only applied to names the server
+      actually advertised in tools/list; a call merely claiming a trusted name gets none.
+
+  toolgate init [--print]
+      Write ~/.toolgate/toolgate.yaml, save the API key for hooks, make one real test decision,
+      install the hook into ~/.claude/settings.json (backup kept), and verify it runs.
+      --print shows the settings snippet instead of writing it.
+
+  toolgate install
+      (Re)install the hooks into ~/.claude/settings.json — e.g. after upgrading node or toolgate.
+      Installs PreToolUse (the gate) and PostToolUse/PostToolUseFailure/PermissionDenied (the
+      action ledger: so a later "bash helper.sh" is judged as what helper.sh does).
+
+  toolgate decide [--policy <path>] [--backend ...]
+      Like hook, but prints the whole decision as JSON (verdict, reason, source, probabilities,
+      latencyMs), allow included. For hosts that act on the verdict themselves, e.g. the
+      Claude Code mod in plugin/. Same audit line and ledger proposal as hook.
+
+  toolgate version
+      Print the installed version.
+
+  toolgate post
+      Run as the PostToolUse / PostToolUseFailure / PermissionDenied hook: settles the ledger
+      entry for the call. Silent, no model call, never fails.
+
+  toolgate doctor
+      Check policy, keys, key file, backend, one real decision, and that the installed hook answers.
+
+  toolgate audit [-n <count>] [--stats] [--since <ISO date | 7d | 24h>] [--host hook|mod|proxy]
+      Show recent audit log entries, or summary statistics (ask/deny rate, latency), optionally
+      restricted to a time window and a host — the cut a measurement window is declared on.
+
+Environment (one key is enough; precedence TYPESAFE > OPENROUTER > AI_GATEWAY when several are set):
+  TYPESAFE_API_KEY     TypeSafe direct API key (console.typesafe.ai → API Keys)
+  OPENROUTER_API_KEY   OpenRouter key (openrouter.ai/keys) — Jev via the Decisions API
+  AI_GATEWAY_API_KEY   Vercel AI Gateway key (vercel.com/<team>/~/ai)
+  TOOLGATE_POLICY      Policy file path (default ~/.toolgate/toolgate.yaml)
+`;
+const ENV_FILE = join(homedir(), '.toolgate', 'env');
+/** Persist the key so hooks work no matter how Claude Code was launched. */
+function saveKeyFile() {
+    const pairs = KEY_ENV_VARS.filter((k) => process.env[k]).map((k) => `${k}=${process.env[k]}`);
+    if (pairs.length === 0)
+        return undefined;
+    mkdirSync(dirname(ENV_FILE), { recursive: true, mode: 0o700 });
+    writeFileSync(ENV_FILE, pairs.join('\n') + '\n', { mode: 0o600 });
+    return ENV_FILE;
+}
+const PACKAGE_VERSION = JSON.parse(readFileSync(join(dirname(fileURLToPath(import.meta.url)), '..', 'package.json'), 'utf8')).version;
+const EXAMPLE_POLICY = join(dirname(fileURLToPath(import.meta.url)), '..', 'examples', 'toolgate.yaml');
+async function main() {
+    loadEnvFile();
+    const rawArgs = process.argv.slice(2);
+    const ddIndex = rawArgs.indexOf('--');
+    const optionArgs = ddIndex >= 0 ? rawArgs.slice(0, ddIndex) : rawArgs;
+    const afterDoubleDash = ddIndex >= 0 ? rawArgs.slice(ddIndex + 1) : [];
+    const { values, positionals } = parseArgs({
+        args: optionArgs,
+        allowPositionals: true,
+        strict: false, // a typo'd flag in settings.json must never take the gate offline
+        options: {
+            policy: { type: 'string' },
+            backend: { type: 'string' },
+            tool: { type: 'string' },
+            input: { type: 'string' },
+            task: { type: 'string', multiple: true },
+            n: { type: 'string', short: 'n', default: '20' },
+            stats: { type: 'boolean' },
+            since: { type: 'string' },
+            host: { type: 'string' },
+            print: { type: 'boolean' },
+            gate: { type: 'string' },
+            'on-ask': { type: 'string' },
+            trusted: { type: 'boolean' },
+            help: { type: 'boolean', short: 'h' },
+        },
+    });
+    const str = (v) => (typeof v === 'string' ? v : undefined);
+    const args = {
+        policy: str(values.policy),
+        backend: str(values.backend),
+        tool: str(values.tool),
+        input: str(values.input),
+        tasks: Array.isArray(values.task) ? values.task.filter((v) => typeof v === 'string') : [],
+        n: str(values.n),
+        stats: values.stats === true,
+        since: str(values.since),
+        host: str(values.host),
+        print: values.print === true,
+        gate: str(values.gate),
+        onAsk: str(values['on-ask']),
+        trusted: values.trusted === true,
+        help: values.help === true,
+    };
+    const cmd = positionals[0] ?? 'hook';
+    if (args.help || cmd === 'help')
+        return console.log(HELP);
+    switch (cmd) {
+        case 'hook':
+            if (process.stdin.isTTY)
+                throw new Error(`hook expects PreToolUse JSON on stdin\n\n${HELP}`);
+            return runHook({ policyPath: args.policy, backend: args.backend });
+        case 'decide':
+            if (process.stdin.isTTY)
+                throw new Error(`decide expects PreToolUse JSON on stdin\n\n${HELP}`);
+            return runDecide({ policyPath: args.policy, backend: args.backend });
+        case 'version':
+            return console.log(PACKAGE_VERSION);
+        case 'post':
+            // PostToolUse / PostToolUseFailure / PermissionDenied: settle the ledger. Silent, never fails.
+            if (process.stdin.isTTY)
+                return;
+            return runPost({ policyPath: args.policy });
+        case 'check': {
+            if (!args.tool)
+                throw new Error('check requires --tool');
+            const policy = loadPolicy(args.policy);
+            const backend = makeBackend(policy, args.backend);
+            const raw = args.input ?? '';
+            let toolInput;
+            try {
+                toolInput = JSON.parse(raw);
+            }
+            catch {
+                toolInput = args.tool === 'Bash' ? { command: raw } : raw;
+            }
+            const input = { tool_name: args.tool, tool_input: toolInput, cwd: process.cwd(), host: 'check' };
+            if (args.tasks.length > 0) {
+                // A transcript of user prompts (in order given; the last is the current task) so the context questions are asked.
+                const transcript = join(mkdtempSync(join(tmpdir(), 'toolgate-')), 'transcript.jsonl');
+                writeFileSync(transcript, args.tasks.map((t) => JSON.stringify({ type: 'user', message: { role: 'user', content: t } })).join('\n') + '\n');
+                input.transcript_path = transcript;
+            }
+            const decision = await decide(input, policy, backend);
+            return console.log(JSON.stringify({ backend: backend.name, ...decision }, null, 2)); // includes `state`: what Jev saw
+        }
+        case 'mcp': {
+            if (args.onAsk !== undefined && args.onAsk !== 'block' && args.onAsk !== 'allow')
+                throw new Error('--on-ask must be block or allow');
+            return runMcp({ policyPath: args.policy, backend: args.backend, gate: args.gate, onAsk: args.onAsk, trusted: args.trusted }, afterDoubleDash);
+        }
+        case 'init': {
+            const path = policyPath(args.policy);
+            if (existsSync(path)) {
+                console.log(`Policy already exists: ${path}`);
+            }
+            else {
+                mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+                copyFileSync(EXAMPLE_POLICY, path);
+                console.log(`Wrote ${path}`);
+            }
+            const saved = saveKeyFile();
+            if (saved)
+                console.log(`Saved key to ${saved} (0600) so hooks work even when Claude Code is launched from the Dock`);
+            if (args.print) {
+                console.log(`\nAdd to ${SETTINGS_PATH} (merge into an existing "hooks" block if you have one):\n\n${settingsSnippet()}`);
+            }
+            else {
+                install();
+            }
+            console.log('');
+            const ok = await doctor(args.policy, args.backend);
+            console.log(ok ? '\nQuit and reopen Claude Code. After a few commands: toolgate audit -n 5' : '\nFix the ✗ lines above, then run: toolgate doctor');
+            if (!ok)
+                process.exitCode = 1;
+            return;
+        }
+        case 'install': {
+            install();
+            return;
+        }
+        case 'doctor': {
+            if (!(await doctor(args.policy, args.backend)))
+                process.exitCode = 1;
+            return;
+        }
+        case 'audit': {
+            const policy = loadPolicy(args.policy);
+            if (!existsSync(policy.audit.path))
+                return console.log(`No audit log at ${policy.audit.path}`);
+            let all = readFileSync(policy.audit.path, 'utf8').trimEnd().split('\n');
+            if (args.since || args.host)
+                all = filterAudit(all, args.since, args.host);
+            if (args.stats)
+                return printStats(all);
+            const n = Math.max(1, Number(args.n) || 20);
+            const lines = all.slice(-n);
+            for (const line of lines) {
+                try {
+                    const e = JSON.parse(line);
+                    const probs = e.probabilities
+                        ? Object.entries(e.probabilities)
+                            .map(([k, v]) => `${k}=${v}`)
+                            .join(' ')
+                        : '';
+                    console.log(`${e.ts}  ${String(e.verdict).padEnd(5)}  ${String(e.tool).padEnd(10)} [${e.source}] ${probs}  ${e.reason}`);
+                }
+                catch {
+                    /* skip malformed lines */
+                }
+            }
+            return;
+        }
+        default:
+            throw new Error(`Unknown command "${cmd}"\n\n${HELP}`);
+    }
+}
+/** Keys → backend → policy → one real decision. Prints what a new user needs to know; returns ok. */
+async function doctor(policyPath, backendOverride) {
+    const line = (ok, msg) => console.log(`${ok ? '✓' : '✗'} ${msg}`);
+    let policy;
+    try {
+        policy = loadPolicy(policyPath);
+        line(true, `policy: ${existsSync(policyPath ?? '') || existsSync(policy.audit.path.replace(/audit\.jsonl$/, 'toolgate.yaml')) ? 'loaded' : 'built-in defaults'} (deny ${policy.thresholds.deny}, ask ${policy.thresholds.ask}, authorized ${policy.thresholds.authorized})`);
+    }
+    catch (err) {
+        line(false, `policy: ${err instanceof Error ? err.message : err}`);
+        return false;
+    }
+    const keysSet = KEY_ENV_VARS.filter((k) => process.env[k]);
+    line(keysSet.length > 0 || backendOverride === 'mock', `keys: ${KEY_ENV_VARS.map((k) => `${k} ${process.env[k] ? 'set' : 'not set'}`).join(', ')}`);
+    let backend;
+    try {
+        const provider = resolveProvider(backendOverride ?? policy.backend.provider); // throws with no key
+        backend = makeBackend(policy, backendOverride);
+        line(true, `backend: ${backend.name} (provider ${provider})`);
+    }
+    catch (err) {
+        line(false, `backend: ${err instanceof Error ? err.message : err}`);
+        console.log('  get a key at console.typesafe.ai (API Keys), openrouter.ai/keys or vercel.com/<team>/~/ai, export it, and run `toolgate doctor` again');
+        return false;
+    }
+    const probe = { tool_name: 'Bash', tool_input: { command: 'git push --force origin main' }, cwd: process.cwd() };
+    const d = await decide(probe, { ...policy, audit: { ...policy.audit, enabled: false } }, backend);
+    if (d.source !== 'model') {
+        line(false, `test decision: ${d.reason}`);
+        return false;
+    }
+    const top = Object.entries(d.probabilities ?? {}).sort((a, b) => b[1] - a[1])[0];
+    line(true, `test decision: \`git push --force origin main\` → ${d.verdict} (${top?.[0]} ${top?.[1]}) in ${d.latencyMs} ms`);
+    // The checks above prove toolgate works from this shell. The ones below prove it works
+    // from Claude Code, which is launched without this shell's PATH or exports.
+    let ok = true;
+    const keyFile = existsSync(ENV_FILE) && /^(TYPESAFE_API_KEY|OPENROUTER_API_KEY|AI_GATEWAY_API_KEY)=./m.test(readFileSync(ENV_FILE, 'utf8'));
+    if (backendOverride !== 'mock') {
+        line(keyFile, keyFile ? `key file: ${ENV_FILE} (read by the hook when Claude Code has no shell exports)` : `key file: ${ENV_FILE} missing — run \`toolgate init\`; without it a Dock-launched Claude Code has no key`);
+        ok &&= keyFile;
+    }
+    let commands = [];
+    try {
+        commands = installedHookCommands(readSettings());
+    }
+    catch (err) {
+        line(false, `settings: ${err instanceof Error ? err.message : err}`);
+        return false;
+    }
+    const installed = commands[0];
+    if (installed === undefined) {
+        // Not a failure by itself: the Claude Code mod gates without a settings.json hook. Both installed
+        // means every call is decided twice, so a mod user should see exactly this line.
+        line(true, `hook: not installed in ${SETTINGS_PATH} (fine if the Claude Code mod is gating: check /toolgate in a session; otherwise run \`toolgate install\`)`);
+        return ok;
+    }
+    const current = installed === hookCommand();
+    line(current, current ? `hook: installed in ${SETTINGS_PATH}` : `hook: installed but not the current command (\`${installed}\`) — run \`toolgate install\` to refresh`);
+    const post = installedPostEvents(readSettings());
+    const postOk = post.length === POST_EVENTS.length;
+    line(postOk, postOk ? `ledger hooks: ${post.join(', ')}` : `ledger hooks: ${post.length ? post.join(', ') : 'none'} — run \`toolgate install\` so write → execute can be tracked`);
+    const self = hookSelfTest(installed);
+    line(self.ok, `hook self-test: ${self.detail}`);
+    return ok && self.ok;
+}
+/** Merge the hook into ~/.claude/settings.json, keeping a backup of whatever was there. */
+function install() {
+    const settings = readSettings();
+    const result = installHook(settings);
+    if (result === 'unchanged')
+        return console.log(`Hook already installed in ${SETTINGS_PATH}`);
+    const backup = writeSettings(settings);
+    console.log(`${result === 'added' ? 'Installed' : 'Updated'} hook in ${SETTINGS_PATH}${backup ? ` (backup: ${backup})` : ''}:\n  ${hookCommand()}`);
+}
+/** `--since 7d`, `--since 24h`, `--since 2026-10-03`, `--since 2026-10-03T00:00:00-04:00`; `--host mod`. Rows without a host match only when no host filter is given. */
+export function filterAudit(lines, since, host) {
+    let from;
+    if (since) {
+        const rel = /^(\d+)\s*([dhm])$/.exec(since.trim());
+        if (rel)
+            from = Date.now() - Number(rel[1]) * { d: 86_400_000, h: 3_600_000, m: 60_000 }[rel[2]];
+        else {
+            const t = Date.parse(since);
+            if (Number.isNaN(t))
+                throw new Error(`--since: expected an ISO date or a duration like 7d / 24h, got "${since}"`);
+            from = t;
+        }
+    }
+    return lines.filter((l) => {
+        try {
+            const e = JSON.parse(l);
+            if (from !== undefined && !(typeof e.ts === 'string' && Date.parse(e.ts) >= from))
+                return false;
+            if (host !== undefined && e.host !== host)
+                return false;
+            return true;
+        }
+        catch {
+            return false;
+        }
+    });
+}
+function printStats(lines) {
+    const rows = lines.map((l) => { try {
+        return JSON.parse(l);
+    }
+    catch {
+        return null;
+    } }).filter(Boolean);
+    if (rows.length === 0)
+        return console.log('no decisions logged yet');
+    const by = (k) => {
+        const m = {};
+        for (const r of rows)
+            m[String(r[k])] = (m[String(r[k])] ?? 0) + 1;
+        return m;
+    };
+    const verdicts = by('verdict');
+    const sources = by('source');
+    const lat = rows.map((r) => r.latency_ms).filter((v) => typeof v === 'number').sort((a, b) => a - b);
+    const pct = (n) => `${Math.round((100 * n) / rows.length)}%`;
+    const q = (p) => lat[Math.min(lat.length - 1, Math.floor(p * lat.length))] ?? 0;
+    const first = rows[0]?.ts, last = rows[rows.length - 1]?.ts;
+    console.log(`${rows.length} decisions  ${first} → ${last}`);
+    console.log(`verdicts: ${Object.entries(verdicts).map(([k, v]) => `${k} ${v} (${pct(v)})`).join(', ')}`);
+    console.log(`sources:  ${Object.entries(sources).map(([k, v]) => `${k} ${v}`).join(', ')}`);
+    if (lat.length)
+        console.log(`model latency (${lat.length} calls): p50 ${q(0.5)} ms, p90 ${q(0.9)} ms, max ${lat[lat.length - 1]} ms`);
+    const tools = by('tool');
+    console.log(`tools:    ${Object.entries(tools).sort((a, b) => b[1] - a[1]).slice(0, 6).map(([k, v]) => `${k} ${v}`).join(', ')}`);
+    const modelRows = rows.filter((r) => r.source === 'model');
+    const withTask = modelRows.filter((r) => r.task?.present === true).length;
+    const truncated = modelRows.filter((r) => r.input_truncated === true).length;
+    if (modelRows.length)
+        console.log(`context:  task present ${withTask}/${modelRows.length}, input truncated ${truncated}/${modelRows.length}`);
+    const modes = by('permission_mode');
+    if (Object.keys(modes).some((k) => k !== 'undefined'))
+        console.log(`modes:    ${Object.entries(modes).map(([k, v]) => `${k} ${v}`).join(', ')}`);
+    const hosts = by('host');
+    if (Object.keys(hosts).some((k) => k !== 'undefined'))
+        console.log(`hosts:    ${Object.entries(hosts).map(([k, v]) => `${k} ${v}`).join(', ')}`);
+    const versions = by('toolgate_version');
+    console.log(`versions: ${Object.entries(versions).map(([k, v]) => `${k} ${v}`).join(', ')}`);
+    const asked = rows.filter((r) => r.verdict === 'ask' || r.verdict === 'deny');
+    if (asked.length) {
+        console.log(`\nrecent ask/deny:`);
+        for (const r of asked.slice(-8))
+            console.log(`  ${String(r.verdict).padEnd(5)} ${String(r.tool).padEnd(8)} ${String(r.input ?? '').slice(0, 70)}  — ${String(r.reason).slice(0, 60)}`);
+    }
+    // Allow-side review: the allowed calls that came closest to a threshold. A firewall is only
+    // as trustworthy as its allows, so surface the near-misses to eyeball for anything that should
+    // not have passed. The bar to publish: this list has no call that should have been stopped.
+    const maxRisk = (r) => {
+        const p = r.probabilities;
+        return p ? Math.max(0, ...Object.entries(p).filter(([k]) => k !== 'authorized').map(([, v]) => v)) : 0;
+    };
+    const allows = rows.filter((r) => r.verdict === 'allow' && r.probabilities).sort((a, b) => maxRisk(b) - maxRisk(a));
+    if (allows.length) {
+        console.log(`\nclosest allows (review — should contain nothing that ought to have been stopped):`);
+        for (const r of allows.slice(0, 8))
+            console.log(`  ${(maxRisk(r) * 100).toFixed(0).padStart(3)}%  ${String(r.tool).padEnd(8)} ${String(r.input ?? '').slice(0, 74)}`);
+    }
+    printAxisHistograms(modelRows, allows);
+}
+/**
+ * Per-axis distribution, because the verdict is a max over axes: the max of seven noisy scores
+ * sits closer to the ask line than any one of them (order-statistic bias), so "29% of allows in
+ * the band" is expected. What matters is WHICH axis owns the band. One axis → a wording or
+ * trusted_* problem; all of them smeared → the model is poorly separated and no threshold saves it.
+ */
+function printAxisHistograms(modelRows, allows) {
+    const BUCKETS = [['<.20', 0, 0.2], ['.20–.39', 0.2, 0.4], ['.40–.54', 0.4, 0.55], ['.55–.84', 0.55, 0.85], ['≥.85', 0.85, 1.01]];
+    const axes = new Map();
+    for (const r of modelRows) {
+        const p = r.probabilities;
+        if (!p)
+            continue;
+        for (const [k, v] of Object.entries(p)) {
+            if (k === 'authorized' || typeof v !== 'number')
+                continue;
+            axes.set(k, [...(axes.get(k) ?? []), v]);
+        }
+    }
+    if (axes.size === 0)
+        return;
+    console.log(`\nper-axis scores (${modelRows.length} model decisions):`);
+    console.log(`  ${'axis'.padEnd(20)}${BUCKETS.map(([l]) => l.padStart(8)).join('')}`);
+    for (const [axis, vals] of [...axes.entries()].sort((a, b) => a[0].localeCompare(b[0]))) {
+        const counts = BUCKETS.map(([, lo, hi]) => vals.filter((v) => v >= lo && v < hi).length);
+        console.log(`  ${axis.padEnd(20)}${counts.map((c) => String(c).padStart(8)).join('')}`);
+    }
+    // Who owns the allow band just under the ask line?
+    const owner = {};
+    for (const r of allows) {
+        const p = r.probabilities;
+        const [k, v] = Object.entries(p).filter(([k]) => k !== 'authorized').sort((a, b) => b[1] - a[1])[0] ?? ['-', 0];
+        if (v >= 0.4 && v < 0.55)
+            owner[k] = (owner[k] ?? 0) + 1;
+    }
+    const band = Object.values(owner).reduce((a, b) => a + b, 0);
+    if (band) {
+        console.log(`allows in the .40–.54 band: ${band}/${allows.length}, top axis: ${Object.entries(owner).sort((a, b) => b[1] - a[1]).map(([k, v]) => `${k} ${v}`).join(', ')}`);
+    }
+}
+main().catch((err) => {
+    console.error(err instanceof Error ? err.message : err);
+    process.exitCode = 1;
+});

@@ -1,0 +1,303 @@
+import { closeSync, fstatSync, openSync, readSync } from 'node:fs';
+export const DEFAULT_LIMITS = { input_chars: 40000, task_chars: 6000, earlier_prompts: 2, session_goal_chars: 1200 };
+/** A prompt shorter than this is a reaction ("ugh", "yes", "try again"), not a goal. */
+const GOAL_MIN_CHARS = 40;
+/** How much of the transcript's head to scan for the first substantive prompt. */
+const GOAL_SCAN_BYTES = 512 * 1024;
+/** Read the transcript backwards in chunks: a few large tool results can push the last real prompt megabytes from the end. */
+const TRANSCRIPT_CHUNK_BYTES = 256 * 1024;
+const TRANSCRIPT_MAX_BYTES = 16 * 1024 * 1024;
+/**
+ * Within a line only (`[ \t]*`, never `\s*`): an empty `DO_SPACES_KEY=` at the end of a line must not
+ * run across the newline and swallow the next line's variable name as if it were the value. The
+ * 0.16.0 measurement window's blind reviewer caught exactly that in a `.env.example` template.
+ */
+const SECRET_PATTERNS = [
+    [/\b([A-Z0-9_]*(?:KEY|TOKEN|SECRET|PASSWORD|PASSWD)[A-Z0-9_]*[ \t]*[=:][ \t]*)\S+/gi, '$1[redacted]'],
+    [/(\bauthorization[ \t]*:[ \t]*)\S+(?:[ \t]+\S+)?/gi, '$1[redacted]'],
+    [/(--?(?:password|passwd|token|api-?key|secret)(?:=|[ \t]+))\S+/gi, '$1[redacted]'],
+    [/\b(?:gh[pousr]_|sk-|xox[baprs]-|AKIA)[A-Za-z0-9_-]{12,}/g, '[redacted]'],
+];
+/**
+ * User turns that are not the person's instruction. A compaction summary is written by the agent
+ * when its context window fills and arrives as a user message, far longer than any typed prompt;
+ * judging the next hour of tool calls against it (0.16.0 window: 78 of 82 truncation asks) is
+ * judging against the wrong thing. Treated as context: skipped as a prompt, usable as the goal.
+ */
+const COMPACTION_SUMMARY = /^(?:\s*<[\w-]+\/>\s*)*(?:This session is being continued from a previous conversation|The summarized conversation included)/;
+const PASTED_CONTENT = /<pasted_content\b[^>]*>[\s\S]*?<\/pasted_content>/g;
+export function isCompactionSummary(text) {
+    return COMPACTION_SUMMARY.test(text);
+}
+const TASK_NOTIFICATION = /<task-notification>[\s\S]*?<\/task-notification>/g;
+/** A pasted log or table is material the person attached, not what they asked for: keep the typed part. */
+export function withoutPastedContent(text) {
+    return text
+        .replace(PASTED_CONTENT, '[pasted content omitted]')
+        .replace(TASK_NOTIFICATION, '[task notification omitted]')
+        .replace(/<artifact-content-authored-by-others\/>\s*/g, '')
+        .trim();
+}
+/**
+ * JSON keys whose values are secrets regardless of what the value looks like. Structured input
+ * (MCP arguments above all) separates the key from the value, so the text patterns above, which
+ * need `KEY=value` in one string, never see `{ "password": "hunter2" }`. Matched on the key's
+ * normalized form (lowercase, separators removed), so `api_key`, `apiKey`, `x-api-key`,
+ * `X_API_KEY` all match.
+ */
+const SENSITIVE_KEY = /^(?:password|passwd|pwd|pass|secret|secretkey|clientsecret|token|accesstoken|refreshtoken|idtoken|bearertoken|authtoken|sessiontoken|apikey|xapikey|apisecret|authorization|auth|cookie|setcookie|credential|credentials|privatekey|passphrase|signingkey|encryptionkey|masterkey|dbpassword|connectionstring|dsn)$/;
+function isSensitiveKey(key) {
+    return SENSITIVE_KEY.test(key.toLowerCase().replace(/[^a-z0-9]/g, ''));
+}
+/** Scrub obvious secrets in free text. Applied to everything that leaves the machine and to the audit log. */
+export function redact(text) {
+    return SECRET_PATTERNS.reduce((t, [re, sub]) => t.replace(re, sub), text);
+}
+/**
+ * Scrub a JSON value: any scalar under a sensitive key is replaced outright; every string is
+ * additionally run through the text patterns. ONE redaction path: the model state and the audit
+ * log both use this, so there is a single transformation to reason about.
+ */
+export function redactInput(v, key) {
+    if (key !== undefined && isSensitiveKey(key) && (typeof v === 'string' || typeof v === 'number' || typeof v === 'boolean'))
+        return '[redacted]';
+    if (typeof v === 'string')
+        return redact(v);
+    if (Array.isArray(v))
+        return v.map((x) => redactInput(x));
+    if (v && typeof v === 'object')
+        return Object.fromEntries(Object.entries(v).map(([k, x]) => [k, redactInput(x, k)]));
+    return v;
+}
+const redactDeep = redactInput;
+/** The tool input as redacted text, for the audit log: the same redaction the model state gets, then flattened. */
+export function redactedInputText(toolInput) {
+    return matchText(redactInput(toJSON(toolInput)));
+}
+/**
+ * The state the decision model evaluates: JSON-clean, secrets redacted, oversized input
+ * truncated (head + tail, flagged so the engine can't `allow` on it). `current_task` is the
+ * latest user prompt; `earlier_prompts` (oldest first) are the ones before it, because in a
+ * working session the latest prompt is often "yes" or "continue".
+ */
+export function buildState(input, includeTaskContext, limits = DEFAULT_LIMITS, trustedHosts = [], trustedTool = false) {
+    const state = {
+        tool: input.tool_name,
+        tool_input: truncateMiddle(redactDeep(toJSON(input.tool_input)), limits.input_chars),
+    };
+    if (input.cwd)
+        state.cwd = input.cwd;
+    if (input.permission_mode)
+        state.permission_mode = input.permission_mode;
+    if (trustedHosts.length > 0)
+        state.trusted_hosts = [...trustedHosts];
+    if (trustedTool)
+        state.trusted_tool = true; // this tool is one the user declared their own service
+    if (includeTaskContext) {
+        const supplied = promptsFrom(input, limits);
+        const [latest, ...earlier] = supplied ?? (input.transcript_path ? recentUserPrompts(input.transcript_path, 1 + limits.earlier_prompts) : []);
+        if (latest !== undefined) {
+            state.current_task = redact(latest.slice(0, limits.task_chars));
+            if (latest.length > limits.task_chars)
+                state.current_task_truncated = true;
+            if (earlier.length > 0) {
+                // Older prompts are context, not the instruction under judgment: cut them without flagging.
+                const each = Math.max(200, Math.floor(limits.task_chars / 2));
+                state.earlier_prompts = earlier.reverse().map((t) => redact(t.length > each ? t.slice(0, each) + ' …' : t));
+            }
+            // The session's opening request. In a long session the latest prompts are "ugh" and "yes pull
+            // it"; the thing the agent is actually doing was stated hours ago. Skipped when it would just
+            // duplicate a prompt the model already sees.
+            if (limits.session_goal_chars > 0) {
+                const goal = supplied ? goalFrom(input) : input.transcript_path ? sessionGoal(input.transcript_path) : undefined;
+                if (goal !== undefined && goal !== latest && !earlier.includes(goal)) {
+                    state.session_goal = redact(goal.length > limits.session_goal_chars ? goal.slice(0, limits.session_goal_chars) + ' …' : goal);
+                }
+            }
+        }
+    }
+    return state;
+}
+/**
+ * Prompts a host supplied in `task_context`, in the order recentUserPrompts returns them (newest
+ * first, then older, newest-of-the-older first). Undefined when none were supplied, so the
+ * transcript path is read instead.
+ */
+function promptsFrom(input, limits) {
+    const tc = input.task_context;
+    if (!tc || typeof tc.current_task !== 'string' || tc.current_task.length === 0)
+        return undefined;
+    const earlier = (tc.earlier_prompts ?? []).filter((p) => typeof p === 'string' && p.length > 0);
+    // earlier_prompts arrive oldest first; recentUserPrompts' order is newest first. A host that did
+    // not filter compaction summaries itself gets the same treatment as the transcript path.
+    const prompts = [tc.current_task, ...earlier.reverse()].filter((p) => !isCompactionSummary(p)).map(withoutPastedContent).filter((p) => p.length > 0);
+    if (prompts.length === 0)
+        return undefined;
+    return prompts.slice(0, 1 + limits.earlier_prompts);
+}
+function goalFrom(input) {
+    const g = input.task_context?.session_goal;
+    if (typeof g !== 'string')
+        return undefined;
+    const goal = withoutPastedContent(g);
+    return goal.length >= GOAL_MIN_CHARS ? goal : undefined;
+}
+/**
+ * The first substantive user prompt of a transcript (≥ GOAL_MIN_CHARS), read forward from the
+ * file's head. Best-effort: any failure means no goal, never a failed gate.
+ */
+export function sessionGoal(transcriptPath) {
+    let fd;
+    try {
+        fd = openSync(transcriptPath, 'r');
+        const size = Math.min(fstatSync(fd).size, GOAL_SCAN_BYTES);
+        const buf = Buffer.alloc(size);
+        readSync(fd, buf, 0, size, 0);
+        const lines = buf.toString('utf8').split('\n');
+        if (size === GOAL_SCAN_BYTES)
+            lines.pop(); // the last line may be cut
+        for (const line of lines) {
+            // A resumed session may open with the compaction summary of the one before: as the goal,
+            // that summary is the best statement of what the agent was asked to do.
+            const text = userText(line, true);
+            if (text && text.length >= GOAL_MIN_CHARS)
+                return text;
+        }
+    }
+    catch {
+        // no goal
+    }
+    finally {
+        if (fd !== undefined)
+            closeSync(fd);
+    }
+    return undefined;
+}
+/**
+ * True when the tool input was cut — the model did not see what it is authorizing. A cut prompt
+ * (`current_task_truncated`) is flagged in the state and the audit row but does not floor the
+ * verdict: 6,000 characters show the whole instruction in practice (p90 of prompt length in the
+ * 0.16.0 window was 885), and what was being cut was compaction summaries, not instructions.
+ */
+export function isTruncated(state) {
+    const t = state.tool_input;
+    return typeof t === 'object' && t !== null && !Array.isArray(t) && t._truncated === true;
+}
+/**
+ * Text the static rules match against: the tool input's values, with quotes
+ * and backslashes stripped so rules are written for raw commands, not JSON.
+ */
+export function matchText(toolInput) {
+    const parts = [];
+    const walk = (v) => {
+        if (typeof v === 'string')
+            parts.push(v);
+        else if (Array.isArray(v))
+            v.forEach(walk);
+        else if (v && typeof v === 'object')
+            Object.entries(v).forEach(([k, val]) => (parts.push(k), walk(val)));
+        else if (v !== undefined && v !== null)
+            parts.push(String(v));
+    };
+    walk(toolInput);
+    return parts.join('\n').replace(/["'\\]/g, '');
+}
+/** Most recent real user prompt from a Claude Code transcript (JSONL). */
+export function lastUserPrompt(transcriptPath) {
+    return recentUserPrompts(transcriptPath, 1)[0];
+}
+/**
+ * The last `count` real user prompts, newest first. Reads the file backwards in chunks
+ * and stops as soon as it has enough, so a transcript full of large tool results still
+ * yields the prompts. Best-effort: any failure means no task context, never a failed gate.
+ */
+export function recentUserPrompts(transcriptPath, count) {
+    const found = [];
+    if (count <= 0)
+        return found;
+    let fd;
+    try {
+        fd = openSync(transcriptPath, 'r');
+        let end = fstatSync(fd).size;
+        const floor = Math.max(0, end - TRANSCRIPT_MAX_BYTES);
+        let carry = Buffer.alloc(0); // the (possibly partial) first line of the previous chunk, as bytes so UTF-8 never splits
+        while (end > floor && found.length < count) {
+            const start = Math.max(floor, end - TRANSCRIPT_CHUNK_BYTES);
+            const buf = Buffer.alloc(end - start);
+            readSync(fd, buf, 0, end - start, start);
+            const chunk = Buffer.concat([buf, carry]);
+            let complete = chunk;
+            carry = Buffer.alloc(0);
+            if (start > floor) {
+                // Not at the file start: the first line may be cut, so hold it back for the next chunk.
+                const nl = chunk.indexOf(0x0a);
+                complete = nl >= 0 ? chunk.subarray(nl + 1) : Buffer.alloc(0);
+                carry = nl >= 0 ? chunk.subarray(0, nl) : chunk;
+            }
+            const lines = complete.toString('utf8').split('\n');
+            for (let i = lines.length - 1; i >= 0 && found.length < count; i--) {
+                const text = userText(lines[i]);
+                if (text)
+                    found.push(text);
+            }
+            end = start;
+        }
+    }
+    catch {
+        // Task context is a nice-to-have; never fail the gate over it.
+    }
+    finally {
+        if (fd !== undefined)
+            closeSync(fd);
+    }
+    return found;
+}
+function userText(line, allowSummary = false) {
+    if (!line)
+        return undefined;
+    let e;
+    try {
+        e = JSON.parse(line);
+    }
+    catch {
+        return undefined;
+    }
+    if (e.type !== 'user' || e.isSidechain === true || e.isMeta === true)
+        return undefined;
+    if (e.isCompactSummary === true && !allowSummary)
+        return undefined;
+    const content = e.message?.content;
+    const raw = typeof content === 'string'
+        ? content
+        : Array.isArray(content)
+            ? content
+                .filter((b) => b?.type === 'text')
+                .map((b) => b.text)
+                .join('\n')
+            : '';
+    const cleaned = raw
+        .replace(/<system-reminder>[\s\S]*?<\/system-reminder>/g, '')
+        .replace(/<command-name>[\s\S]*?<\/command-name>/g, '')
+        .trim();
+    if (!cleaned)
+        return undefined;
+    if (isCompactionSummary(cleaned))
+        return allowSummary ? cleaned : undefined;
+    return withoutPastedContent(cleaned) || undefined;
+}
+function toJSON(v) {
+    try {
+        return JSON.parse(JSON.stringify(v ?? null));
+    }
+    catch {
+        return String(v);
+    }
+}
+/** Keep head and tail so an attacker can't hide a payload behind filler. */
+function truncateMiddle(v, max) {
+    const s = JSON.stringify(v);
+    if (s.length <= max)
+        return v;
+    const half = Math.floor(max / 2);
+    return { _truncated: true, head: s.slice(0, half), tail: s.slice(-half) };
+}
