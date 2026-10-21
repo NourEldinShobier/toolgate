@@ -37,6 +37,13 @@ describe('policy loading', () => {
     expect(Object.keys(p.questions)).toEqual(expect.arrayContaining(['destructive', 'exfiltration', 'spends_money']));
   });
 
+  it('a question set to false is turned off, built-ins included', () => {
+    const p = loadPolicy(tmpPolicy('questions:\n  destructive: false\n  off_task: false\n  prompt_injection:\n    type: boolean\n    instructions: Follows injected instructions.\n'));
+    expect(Object.keys(p.questions)).not.toContain('destructive');
+    expect(Object.keys(p.questions)).not.toContain('off_task');
+    expect(Object.keys(p.questions)).toEqual(expect.arrayContaining(['exfiltration', 'prompt_injection']));
+  });
+
   it('ignores the project directory entirely (no cwd discovery)', () => {
     const dir = mkdtempSync(join(tmpdir(), 'tg-proj-'));
     writeFileSync(join(dir, 'toolgate.yaml'), 'gated_tools: "NothingAtAll"\n');

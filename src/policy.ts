@@ -267,6 +267,8 @@ function mergePolicy(base: Policy, user: Record<string, unknown>): Policy {
     ledger: { ...base.ledger, ...obj(user.ledger) },
     questions: { ...base.questions, ...(obj(user.questions) as Questions) },
   };
+  // `name: false` under questions turns that question off, built-ins included.
+  for (const [key, q] of Object.entries(merged.questions)) if ((q as unknown) === false) delete merged.questions[key];
   merged.audit.path = expandTilde(String(merged.audit.path));
   merged.ledger.dir = expandTilde(String(merged.ledger.dir));
   validatePolicy(merged);

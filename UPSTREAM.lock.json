@@ -1,0 +1,12 @@
+{
+  "upstream": "https://github.com/RiskAverseTech/toolgate",
+  "branch": "main",
+  "synced_commit": "0ff0633e245d472756766f023a53808a66e0017c",
+  "synced_version": "0.17.1",
+  "synced_on": "2026-10-21",
+  "our_changes": [
+    "src/policy.ts: a question set to `false` in toolgate.yaml is turned off, built-ins included",
+    "test/policy.test.ts: test for that"
+  ],
+  "how_to_sync": "git fetch upstream && git merge upstream/main, then update synced_commit, synced_version and synced_on"
+}
