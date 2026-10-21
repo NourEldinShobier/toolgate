@@ -6,7 +6,11 @@
   "synced_on": "2026-10-21",
   "our_changes": [
     "src/policy.ts: a question set to `false` in toolgate.yaml is turned off, built-ins included",
-    "test/policy.test.ts: test for that"
+    "test/policy.test.ts: test for that",
+    "src/install.ts: doctor hook self-test uses Git Bash on Windows (Claude Code runs hooks with it; /bin/sh does not exist there)"
   ],
-  "how_to_sync": "git fetch upstream && git merge upstream/main, then update synced_commit, synced_version and synced_on"
+  "how_to_sync": "git fetch upstream && git merge upstream/main, then update synced_commit, synced_version and synced_on",
+  "known_issues": [
+    "On Windows 70 upstream tests fail (65 in test/ledger.test.ts): the action ledger compares POSIX paths. Its facts only feed destructive/exfiltration/privilege/secret_exposure, which this machine turns off."
+  ]
 }
