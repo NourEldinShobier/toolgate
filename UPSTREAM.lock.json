@@ -9,7 +9,7 @@
     "test/policy.test.ts: test for that",
     "src/install.ts: doctor hook self-test uses Git Bash on Windows (Claude Code runs hooks with it; /bin/sh does not exist there)",
     "examples/injection-only.yaml: the prompt-injection-only policy claude-tuning installs",
-    "dist/ is committed (built with npm run build) so `npm install -g --allow-git=all github:NourEldinShobier/toolgate` works without running build scripts, which npm 12 blocks"
+    "dist/ is committed (built with npm run build, which keeps dist/cli.js executable) so claude-tuning installs it from the GitHub tarball (https://codeload.github.com/NourEldinShobier/toolgate/tar.gz/<commit>) without running build scripts, which npm 12 blocks"
   ],
   "how_to_sync": "git fetch upstream && git merge upstream/main, then update synced_commit, synced_version and synced_on",
   "known_issues": [
