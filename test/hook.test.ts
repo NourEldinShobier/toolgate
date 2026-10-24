@@ -1,8 +1,9 @@
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, writeFileSync } from 'node:fs';
+import { writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
+import { mkdtempSync } from './tmp.js';
 import { toHookOutput } from '../src/hook.js';
 import { buildState, redact, redactInput, redactedInputText } from '../src/state.js';
 import { DEFAULT_JEV_MODEL, makeBackend } from '../src/hook.js';

@@ -1,7 +1,8 @@
-import { mkdtempSync, writeFileSync } from 'node:fs';
+import { writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
+import { mkdtempSync } from './tmp.js';
 import { DEFAULT_RULES, defaultPolicy, loadEnvFile, loadPolicy, toolMatcherToRegex, validatePolicy } from '../src/policy.js';
 
 function tmpPolicy(yaml: string): string {

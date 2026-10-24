@@ -1,7 +1,8 @@
-import { mkdtempSync, readFileSync, writeFileSync, existsSync, readdirSync } from 'node:fs';
+import { readFileSync, writeFileSync, existsSync, readdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
+import { mkdtempSync } from './tmp.js';
 import { hookCommand, hookSelfTest, installHook, installedHookCommands, installedPostEvents, postCommand, readSettings, settingsSnippet, writeSettings } from '../src/install.js';
 
 const DIST_CLI = join(__dirname, '..', 'dist', 'cli.js');

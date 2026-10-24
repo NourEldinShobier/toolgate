@@ -1,8 +1,9 @@
 import { execFileSync, spawnSync } from 'node:child_process';
-import { mkdtempSync, writeFileSync, chmodSync } from 'node:fs';
+import { writeFileSync, chmodSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
+import { mkdtempSync } from './tmp.js';
 import { AdvertisedTools, actOnDecision, blockedResult, createFramer, isToolCall, isUngateableToolCall, parseMessage, trustDecision } from '../src/mcp.js';
 import type { Decision } from '../src/types.js';
 

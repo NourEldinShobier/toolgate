@@ -1,7 +1,8 @@
-import { mkdtempSync, writeFileSync } from 'node:fs';
+import { writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
+import { mkdtempSync } from './tmp.js';
 import { decide } from '../src/engine.js';
 import { defaultPolicy } from '../src/policy.js';
 import { MockBackend } from '../src/backends/mock.js';

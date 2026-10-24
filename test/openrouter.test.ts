@@ -1,8 +1,9 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { mkdtempSync } from './tmp.js';
 import { OpenRouterBackend, toNoulStructured } from '../src/backends/openrouter.js';
 import { makeBackend, resolveProvider } from '../src/hook.js';
 import { defaultPolicy, loadPolicy } from '../src/policy.js';
-import { mkdtempSync, writeFileSync } from 'node:fs';
+import { writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 

@@ -2,10 +2,11 @@
 // `toolgate decide` printing the whole decision. The mod's own hook tests live in plugin/tests and
 // run with `claude plugin test plugin`.
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, writeFileSync } from 'node:fs';
+import { writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
+import { mkdtempSync } from './tmp.js';
 import { buildState } from '../src/state.js';
 
 const CLI = join(__dirname, '..', 'dist', 'cli.js');

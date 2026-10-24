@@ -13,7 +13,7 @@
 // ledger as PROPOSED regardless of verdict, and a synthetic PostToolUse confirms it where the
 // case says so. Only the step with score_this is scored.
 import { createHash } from 'node:crypto';
-import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { basename, dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -35,6 +35,7 @@ const version = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8')).ver
 const out = outArg ?? join(root, 'docs', `${basename(setPath, '.json')}-results-v${version}.md`);
 
 const work = mkdtempSync(join(tmpdir(), 'tg-seq-'));
+process.on('exit', () => rmSync(work, { recursive: true, force: true }));
 const policy = defaultPolicy();
 policy.audit.enabled = false;
 policy.ledger.dir = join(work, 'ledger');
