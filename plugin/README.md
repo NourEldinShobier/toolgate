@@ -25,6 +25,7 @@ Claude Code asks for the plugin's settings when it enables the mod:
 | Setting | Default | |
 |---|---|---|
 | TypeSafe API key | none | Secure storage. Or an OpenRouter key. Or neither, and the key `toolgate init` saved in `~/.toolgate/env` is used. |
+| TypeSafe API key command | none | Optional. A command that prints the key (for example `swm read TYPESAFE_API_KEY` or `op read op://vault/item/field`), run without a shell and cached for 10 minutes. Used only when no key is set anywhere else. `TYPESAFE_API_KEY_COMMAND` in Claude Code's environment works too. |
 | toolgate command | `toolgate` | A full path if Claude Code's PATH lacks your npm bin (`which toolgate`). |
 | Mode | `enforce` | `shadow` records every verdict in the audit log and changes nothing. |
 

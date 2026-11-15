@@ -34,7 +34,7 @@ toolgate init                   # policy + key file + hook installed into ~/.cla
 
 Then quit and reopen Claude Code. That's it.
 
-`init` writes `~/.toolgate/toolgate.yaml`, saves your key to `~/.toolgate/env` (mode 0600), adds the hook to `~/.claude/settings.json` (keeping a backup, merging with any hooks you already have), and then runs `doctor`, which proves the whole chain: key found, backend chosen, one live verdict with its latency, hook present in settings, and the installed hook answering under a minimal environment — the one a Dock-launched Claude Code actually has, with no shell exports and no npm bin on PATH. The hook command names `node` and toolgate by absolute path, so PATH never matters. `toolgate doctor` repeats every check any time; `toolgate install` refreshes the hook after you upgrade node or toolgate; `toolgate init --print` shows the snippet instead if you'd rather merge it by hand (see [`examples/claude-settings.json`](examples/claude-settings.json)).
+`init` writes `~/.toolgate/toolgate.yaml`, saves your key to `~/.toolgate/env` (mode 0600; to avoid a plain-text key file, use [a key command](#key-from-a-command-optional) instead), adds the hook to `~/.claude/settings.json` (keeping a backup, merging with any hooks you already have), and then runs `doctor`, which proves the whole chain: key found, backend chosen, one live verdict with its latency, hook present in settings, and the installed hook answering under a minimal environment — the one a Dock-launched Claude Code actually has, with no shell exports and no npm bin on PATH. The hook command names `node` and toolgate by absolute path, so PATH never matters. `toolgate doctor` repeats every check any time; `toolgate install` refreshes the hook after you upgrade node or toolgate; `toolgate init --print` shows the snippet instead if you'd rather merge it by hand (see [`examples/claude-settings.json`](examples/claude-settings.json)).
 
 Risky tool calls now get denied or bounced to a confirmation prompt, with the reason shown to you and, on a deny, to the model. Allowed calls stay quiet (`show_allows: true` to see them). If the model is ever unreachable, the hook says `[toolgate] NOT gating: …` rather than silently standing down.
 
@@ -51,6 +51,21 @@ claude plugin install toolgate@riskaverse
 ```
 
 Claude Code asks for your TypeSafe or OpenRouter key when it enables the mod and keeps it in secure storage (or leave both empty to use the key `toolgate init` saved). The mod hooks `tool.check` for the verdict — **allow** runs the tool, **ask** goes to the mode's decider (the dialog, or the auto-mode classifier), **deny** refuses it with the reason the model reads — and `tool.call` afterwards to settle the action ledger, exactly as the hook pair does. Task context comes from the session's transcript rather than a file path. `/toolgate` shows the audit summary; a `shadow` mode records every verdict without enforcing, for measuring first. Run the mod or the hook, not both. Details and tests: [`plugin/README.md`](plugin/README.md).
+
+### Key from a command (optional)
+
+`toolgate init` saves a key you exported to `~/.toolgate/env` as plain text (mode 0600). To keep the key in a password manager instead, set `TYPESAFE_API_KEY_COMMAND` to a command that prints it:
+
+```bash
+export TYPESAFE_API_KEY_COMMAND='swm read TYPESAFE_API_KEY'
+# or
+export TYPESAFE_API_KEY_COMMAND='op read op://vault/item/field'
+toolgate init
+```
+
+The command is split on whitespace (single and double quotes group words) and run directly, with no shell, so pipes and redirects do not work; point it at a script if you need them. The first line of its output, trimmed, is the key (empty or over 4096 characters is rejected). It runs with a 30 second timeout. Any failure means "no key": the key and the command's output are never logged or put in an error message.
+
+It is used only when no other source supplies a key: `TYPESAFE_API_KEY`, `OPENROUTER_API_KEY` and `AI_GATEWAY_API_KEY` (environment or `~/.toolgate/env`) all win over it. A success is cached for 10 minutes and a failure for 30 seconds, and concurrent calls share one run. The Claude Code mod reads the variable from Claude Code's environment (including the `env` block of `settings.json`) or from its "TypeSafe API key command" setting, runs it inside Claude Code, and hands the key to the CLI for each call. `init` saves the command, not the key, to `~/.toolgate/env`.
 
 ## How it decides
 

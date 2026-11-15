@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.18.0 — key from a command
+
+- **`TYPESAFE_API_KEY_COMMAND`** (optional): a command whose first output line is the TypeSafe key, so the key can live in a password manager. Split on whitespace with quote grouping, run with `execFile` (no shell, 30 s timeout, 64 KB output cap), first line trimmed, empty or over 4096 characters rejected; any failure is "no key". The key and the command's output never appear in a log or error message.
+- Consulted only when no other source supplies a key (`TYPESAFE_API_KEY`, `OPENROUTER_API_KEY`, `AI_GATEWAY_API_KEY`, environment or `~/.toolgate/env`), so existing setups behave as before. `auto` falls back to the TypeSafe backend when only the command is set.
+- A success is cached for 10 minutes, a failure for 30 seconds, and concurrent callers share one run. The mod runs the command inside Claude Code (new `typesafe_api_key_command` setting, or the variable in Claude Code's environment) and passes the key to the CLI, which is a new process per call.
+- `toolgate init` and `doctor` know the variable; `init` saves the command, not the key. README: "Key from a command (optional)".
+
 ## 0.17.1 — what the third window asked for
 
 `docs/usage-2026-10-15.md`: the first window cut by host from the log itself. 0.17.0, Oct 13, 318 decisions: ask 13.8% (20.9% → 15.6% → 13.8%), one deny, zero permissive misses on the author's pass. The three days around it run 17.5%. What 0.17.0 fixed is verified (the truncation floor fired once instead of 82 times, the read-only waiver 11 times, the confirmation memory once); what remains is the model's own `off_task` on investigative writes against reaction prompts, and exfiltration asks on the author's own services with `trusted_hosts` still empty.

@@ -27,8 +27,8 @@ class LazyGatewayBackend {
 }
 /** The Jev version every published number was measured on. Moved deliberately, after a frozen-set run. */
 export const DEFAULT_JEV_MODEL = 'jev-1.13.0';
-/** Key precedence for `auto`: TypeSafe direct, then OpenRouter, then Vercel AI Gateway. */
-export const KEY_ENV_VARS = ['TYPESAFE_API_KEY', 'OPENROUTER_API_KEY', 'AI_GATEWAY_API_KEY'];
+/** Key precedence for `auto`: TypeSafe direct, then OpenRouter, then Vercel AI Gateway, then TypeSafe via TYPESAFE_API_KEY_COMMAND. */
+export const KEY_ENV_VARS = ['TYPESAFE_API_KEY', 'OPENROUTER_API_KEY', 'AI_GATEWAY_API_KEY', 'TYPESAFE_API_KEY_COMMAND'];
 export function resolveProvider(provider) {
     if (provider !== 'auto')
         return provider;
@@ -38,7 +38,9 @@ export function resolveProvider(provider) {
         return 'openrouter';
     if (process.env.AI_GATEWAY_API_KEY)
         return 'gateway';
-    throw new Error('no API key found: set TYPESAFE_API_KEY (console.typesafe.ai), OPENROUTER_API_KEY (openrouter.ai/keys) or AI_GATEWAY_API_KEY (vercel.com/<team>/~/ai)');
+    if (process.env.TYPESAFE_API_KEY_COMMAND)
+        return 'typesafe';
+    throw new Error('no API key found: set TYPESAFE_API_KEY (console.typesafe.ai), OPENROUTER_API_KEY (openrouter.ai/keys) or AI_GATEWAY_API_KEY (vercel.com/<team>/~/ai), or TYPESAFE_API_KEY_COMMAND');
 }
 /**
  * A missing key is "decision model unavailable", not an internal error: static rules still

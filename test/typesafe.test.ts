@@ -34,6 +34,7 @@ describe('TypeSafe direct backend', () => {
 
   it('auto resolves typesafe over gateway, and fails loudly with neither', () => {
     const env = { ...process.env };
+    delete process.env.TYPESAFE_API_KEY_COMMAND;
     process.env.TYPESAFE_API_KEY = 't'; process.env.AI_GATEWAY_API_KEY = 'g';
     expect(resolveProvider('auto')).toBe('typesafe');
     delete process.env.TYPESAFE_API_KEY;

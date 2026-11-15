@@ -1,30 +1,35 @@
+import { KEY_COMMAND_ENV, keyFromCommand } from '../keycommand.js';
 /**
  * TypeSafe's direct API (api.typesafe.ai/v1/systemone). No SDK, plain fetch.
  * Boolean questions are "noul" there and take instructions only, so the
  * true/false criteria are folded into the instructions text.
- * Auth: TYPESAFE_API_KEY. One attempt, hard wall-clock budget.
+ * Auth: TYPESAFE_API_KEY, or when it is unset the first line printed by TYPESAFE_API_KEY_COMMAND
+ * (keys kept in a password manager; see keycommand.ts). One attempt, hard wall-clock budget.
  */
 export class TypeSafeBackend {
     model;
     apiKey;
     endpoint;
+    keyCommand;
     name;
-    constructor(model = 'jev-latest', apiKey = process.env.TYPESAFE_API_KEY, endpoint = 'https://api.typesafe.ai/v1/systemone') {
+    constructor(model = 'jev-latest', apiKey = process.env.TYPESAFE_API_KEY, endpoint = 'https://api.typesafe.ai/v1/systemone', keyCommand = process.env[KEY_COMMAND_ENV]) {
         this.model = model;
         this.apiKey = apiKey;
         this.endpoint = endpoint;
+        this.keyCommand = keyCommand;
         this.name = `typesafe:${model}`;
     }
     async evaluate(state, questions, opts) {
-        if (!this.apiKey)
-            throw new Error('TYPESAFE_API_KEY is not set');
+        const apiKey = this.apiKey || (this.keyCommand ? await keyFromCommand(this.keyCommand) : undefined);
+        if (!apiKey)
+            throw new Error(this.keyCommand ? 'TYPESAFE_API_KEY is not set and TYPESAFE_API_KEY_COMMAND returned no key' : 'TYPESAFE_API_KEY is not set');
         const timeoutMs = opts?.timeoutMs ?? 5000;
         const controller = new AbortController();
         const timer = setTimeout(() => controller.abort(), timeoutMs);
         try {
             const res = await fetch(this.endpoint, {
                 method: 'POST',
-                headers: { authorization: `Bearer ${this.apiKey}`, 'content-type': 'application/json' },
+                headers: { authorization: `Bearer ${apiKey}`, 'content-type': 'application/json' },
                 body: JSON.stringify({ model: this.model, state, questions: toNoul(questions) }),
                 signal: controller.signal,
             });

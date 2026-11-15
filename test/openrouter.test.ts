@@ -58,6 +58,7 @@ describe('OpenRouter Decisions backend', () => {
 
   it('auto resolves typesafe > openrouter > gateway', () => {
     const env = { ...process.env };
+    delete process.env.TYPESAFE_API_KEY_COMMAND;
     process.env.TYPESAFE_API_KEY = 't'; process.env.OPENROUTER_API_KEY = 'o'; process.env.AI_GATEWAY_API_KEY = 'g';
     expect(resolveProvider('auto')).toBe('typesafe');
     delete process.env.TYPESAFE_API_KEY;

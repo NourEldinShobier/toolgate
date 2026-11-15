@@ -64,6 +64,7 @@ Environment (one key is enough; precedence TYPESAFE > OPENROUTER > AI_GATEWAY wh
   TYPESAFE_API_KEY     TypeSafe direct API key (console.typesafe.ai → API Keys)
   OPENROUTER_API_KEY   OpenRouter key (openrouter.ai/keys) — Jev via the Decisions API
   AI_GATEWAY_API_KEY   Vercel AI Gateway key (vercel.com/<team>/~/ai)
+  TYPESAFE_API_KEY_COMMAND  Command whose first output line is the TypeSafe key; used only when no key above is set
   TOOLGATE_POLICY      Policy file path (default ~/.toolgate/toolgate.yaml)
 `;
 
@@ -272,7 +273,7 @@ async function doctor(policyPath?: string, backendOverride?: string): Promise<bo
   // The checks above prove toolgate works from this shell. The ones below prove it works
   // from Claude Code, which is launched without this shell's PATH or exports.
   let ok = true;
-  const keyFile = existsSync(ENV_FILE) && /^(TYPESAFE_API_KEY|OPENROUTER_API_KEY|AI_GATEWAY_API_KEY)=./m.test(readFileSync(ENV_FILE, 'utf8'));
+  const keyFile = existsSync(ENV_FILE) && /^(TYPESAFE_API_KEY|OPENROUTER_API_KEY|AI_GATEWAY_API_KEY|TYPESAFE_API_KEY_COMMAND)=./m.test(readFileSync(ENV_FILE, 'utf8'));
   if (backendOverride !== 'mock') {
     line(keyFile, keyFile ? `key file: ${ENV_FILE} (read by the hook when Claude Code has no shell exports)` : `key file: ${ENV_FILE} missing — run \`toolgate init\`; without it a Dock-launched Claude Code has no key`);
     ok &&= keyFile;

@@ -33,6 +33,65 @@ const EARLIER_PROMPTS = 2
 const GOAL_MIN_CHARS = 40
 const DECIDE_TIMEOUT_MS = 20_000
 const POST_TIMEOUT_MS = 10_000
+const KEY_COMMAND_TIMEOUT_MS = 30_000
+const KEY_OK_TTL_MS = 10 * 60_000
+const KEY_FAIL_TTL_MS = 30_000
+const MAX_KEY_CHARS = 4096
+
+// Whitespace-separated argv; single and double quotes group words; no shell. Same rule as splitCommand
+// in src/keycommand.ts (the mod ships without the CLI's sources, so it carries its own copy).
+function splitCommand(command: string): string[] {
+  const argv: string[] = []
+  let cur = ''
+  let quote: string | undefined
+  let started = false
+  for (const ch of command) {
+    if (quote) {
+      if (ch === quote) quote = undefined
+      else cur += ch
+    } else if (ch === '"' || ch === "'") {
+      quote = ch
+      started = true
+    } else if (/\s/.test(ch)) {
+      if (started) argv.push(cur)
+      cur = ''
+      started = false
+    } else {
+      cur += ch
+      started = true
+    }
+  }
+  if (started) argv.push(cur)
+  return argv
+}
+
+// The key command's result, cached in Claude Code's own process (the CLI is a new process per call):
+// a success for 10 minutes, a failure for 30 seconds, concurrent checks share one run. Failures of every
+// kind are "no key"; nothing the command printed is kept beyond the key itself.
+const keyCache: { command?: string; until: number; key: string | undefined } = { until: 0, key: undefined }
+let keyInflight: Promise<string | undefined> | undefined
+
+async function commandKey($: { process: { run(argv: string[], init?: { timeoutMs?: number }): Promise<{ exitCode: number; stdout: string }> } }, command: string): Promise<string | undefined> {
+  if (keyCache.command === command && Date.now() < keyCache.until) return keyCache.key
+  keyInflight ??= (async () => {
+    let key: string | undefined
+    try {
+      const argv = splitCommand(command)
+      if (argv.length > 0) {
+        const ran = await $.process.run(argv, { timeoutMs: KEY_COMMAND_TIMEOUT_MS })
+        const first = ran.exitCode === 0 ? (ran.stdout.trim().split('\n')[0] ?? '').trim() : ''
+        if (first.length > 0 && first.length <= MAX_KEY_CHARS) key = first
+      }
+    } catch {
+      // spawn failure or timeout: no key
+    }
+    keyCache.command = command
+    keyCache.key = key
+    keyCache.until = Date.now() + (key ? KEY_OK_TTL_MS : KEY_FAIL_TTL_MS)
+    return key
+  })().finally(() => { keyInflight = undefined })
+  return keyInflight
+}
 
 // Session counters: these reset on a hot reload, which is fine for a status line.
 const counts = { allow: 0, ask: 0, deny: 0, passthrough: 0, errors: 0 }
@@ -85,9 +144,13 @@ export const register: Register = (on, options) => {
   let binary = typeof options.binary === 'string' && options.binary.length > 0 ? options.binary : 'toolgate'
   const shadow = options.mode === 'shadow'
   const keyEnv: Record<string, string> = {}
+  const procEnv: Record<string, string | undefined> = (globalThis as { process?: { env?: Record<string, string | undefined> } }).process?.env ?? {}
   if (typeof options.typesafe_api_key === 'string' && options.typesafe_api_key.length > 0) keyEnv.TYPESAFE_API_KEY = options.typesafe_api_key
   if (typeof options.openrouter_api_key === 'string' && options.openrouter_api_key.length > 0) keyEnv.OPENROUTER_API_KEY = options.openrouter_api_key
-
+  // Key from a command (TYPESAFE_API_KEY_COMMAND, or the typesafe_api_key_command setting): consulted only when
+  // no key is configured anywhere this mod can see. The key is cached here, in Claude Code's own process (a success
+  // 10 minutes, a failure 30 seconds, concurrent checks share one run), because the CLI is a new process per call.
+  const keyCommand = typeof options.typesafe_api_key_command === 'string' && options.typesafe_api_key_command.trim().length > 0 ? options.typesafe_api_key_command : procEnv.TYPESAFE_API_KEY_COMMAND
   on('session.start', async ($, e, next) => {
     await $.command.register({ name: 'toolgate', description: 'toolgate: audit summary and this session’s verdict counts' })
     // A desktop-app Claude Code has no shell PATH, so a bare `toolgate` is ENOENT there even though
@@ -159,7 +222,14 @@ export const register: Register = (on, options) => {
         tool_input: e.input,
         task_context: taskContextFrom(messages),
       }
-      const ran = await $.process.run([binary, 'decide'], { stdin: JSON.stringify(payload), env: keyEnv, timeoutMs: DECIDE_TIMEOUT_MS })
+      const env = { ...keyEnv }
+      const anyKey = ['TYPESAFE_API_KEY', 'OPENROUTER_API_KEY', 'AI_GATEWAY_API_KEY'].some((k) => env[k] || procEnv[k])
+      if (keyCommand && !anyKey) {
+        const key = await commandKey($, keyCommand)
+        if (key) env.TYPESAFE_API_KEY = key
+        env.TYPESAFE_API_KEY_COMMAND = '' // asked here already; the CLI must not run it again per call
+      }
+      const ran = await $.process.run([binary, 'decide'], { stdin: JSON.stringify(payload), env, timeoutMs: DECIDE_TIMEOUT_MS })
       decision = parseDecision(ran.stdout)
       if (!decision) throw new Error(ran.stderr.trim() || `no decision on stdout (exit ${ran.exitCode})`)
     } catch (err) {

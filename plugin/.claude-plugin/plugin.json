@@ -1,7 +1,7 @@
 {
   "name": "toolgate",
   "displayName": "toolgate",
-  "version": "0.17.1",
+  "version": "0.18.0",
   "description": "Tool-call firewall for Claude Code built on TypeSafe's Jev: seven risk questions, an action ledger that judges files at write time, floors on the axes that must not soften, and ask instead of allow when the model is unreachable. Every verdict logged with its probabilities.",
   "author": { "name": "Jaz", "email": "jaz@riskaversetechcompany.com", "url": "https://github.com/RiskAverseTech/toolgate" },
   "homepage": "https://github.com/RiskAverseTech/toolgate",
@@ -14,6 +14,12 @@
       "title": "TypeSafe API key",
       "description": "From console.typesafe.ai. Leave empty to use OpenRouter instead, or the key toolgate init saved in ~/.toolgate/env.",
       "sensitive": true
+    },
+    "typesafe_api_key_command": {
+      "type": "string",
+      "title": "TypeSafe API key command",
+      "description": "Optional. A command that prints the key on its first line, for a key kept in a password manager (no shell; quotes group words). Used only when no key is set anywhere else.",
+      "default": ""
     },
     "openrouter_api_key": {
       "type": "string",

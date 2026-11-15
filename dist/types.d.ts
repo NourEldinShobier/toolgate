@@ -88,7 +88,7 @@ export interface StaticRule {
     reason?: string;
 }
 export interface Policy {
-    /** auto = typesafe if TYPESAFE_API_KEY is set, else openrouter if OPENROUTER_API_KEY is set, else gateway if AI_GATEWAY_API_KEY is set. */
+    /** auto = typesafe if TYPESAFE_API_KEY is set, else openrouter if OPENROUTER_API_KEY is set, else gateway if AI_GATEWAY_API_KEY is set, else typesafe if TYPESAFE_API_KEY_COMMAND is set. */
     backend: {
         provider: 'auto' | 'typesafe' | 'openrouter' | 'gateway' | 'mock';
         model: string;

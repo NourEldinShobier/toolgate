@@ -1,10 +1,12 @@
+import { KEY_COMMAND_ENV, keyFromCommand } from '../keycommand.js';
 import type { Answers, DecisionBackend, JSONObject, Questions } from '../types.js';
 
 /**
  * TypeSafe's direct API (api.typesafe.ai/v1/systemone). No SDK, plain fetch.
  * Boolean questions are "noul" there and take instructions only, so the
  * true/false criteria are folded into the instructions text.
- * Auth: TYPESAFE_API_KEY. One attempt, hard wall-clock budget.
+ * Auth: TYPESAFE_API_KEY, or when it is unset the first line printed by TYPESAFE_API_KEY_COMMAND
+ * (keys kept in a password manager; see keycommand.ts). One attempt, hard wall-clock budget.
  */
 export class TypeSafeBackend implements DecisionBackend {
   readonly name: string;
@@ -13,19 +15,21 @@ export class TypeSafeBackend implements DecisionBackend {
     private readonly model = 'jev-latest',
     private readonly apiKey = process.env.TYPESAFE_API_KEY,
     private readonly endpoint = 'https://api.typesafe.ai/v1/systemone',
+    private readonly keyCommand = process.env[KEY_COMMAND_ENV],
   ) {
     this.name = `typesafe:${model}`;
   }
 
   async evaluate(state: JSONObject, questions: Questions, opts?: { timeoutMs?: number }): Promise<Answers> {
-    if (!this.apiKey) throw new Error('TYPESAFE_API_KEY is not set');
+    const apiKey = this.apiKey || (this.keyCommand ? await keyFromCommand(this.keyCommand) : undefined);
+    if (!apiKey) throw new Error(this.keyCommand ? 'TYPESAFE_API_KEY is not set and TYPESAFE_API_KEY_COMMAND returned no key' : 'TYPESAFE_API_KEY is not set');
     const timeoutMs = opts?.timeoutMs ?? 5000;
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeoutMs);
     try {
       const res = await fetch(this.endpoint, {
         method: 'POST',
-        headers: { authorization: `Bearer ${this.apiKey}`, 'content-type': 'application/json' },
+        headers: { authorization: `Bearer ${apiKey}`, 'content-type': 'application/json' },
         body: JSON.stringify({ model: this.model, state, questions: toNoul(questions) }),
         signal: controller.signal,
       });

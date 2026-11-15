@@ -3,8 +3,8 @@ import type { Decision, DecisionBackend, Policy } from './types.js';
 export declare const DEFAULT_JEV_MODEL = "jev-1.13.0";
 /** Which real backend `auto` resolves to, from the environment. */
 export type Provider = 'typesafe' | 'openrouter' | 'gateway' | 'mock';
-/** Key precedence for `auto`: TypeSafe direct, then OpenRouter, then Vercel AI Gateway. */
-export declare const KEY_ENV_VARS: readonly ["TYPESAFE_API_KEY", "OPENROUTER_API_KEY", "AI_GATEWAY_API_KEY"];
+/** Key precedence for `auto`: TypeSafe direct, then OpenRouter, then Vercel AI Gateway, then TypeSafe via TYPESAFE_API_KEY_COMMAND. */
+export declare const KEY_ENV_VARS: readonly ["TYPESAFE_API_KEY", "OPENROUTER_API_KEY", "AI_GATEWAY_API_KEY", "TYPESAFE_API_KEY_COMMAND"];
 export declare function resolveProvider(provider: string): Provider;
 export declare function makeBackend(policy: Policy, override?: string): DecisionBackend;
 /**

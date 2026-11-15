@@ -6,10 +6,11 @@ const ok = (stdout: string) => ({ value: run(stdout) })
 const value = <T,>(v: T) => ({ value: v })
 
 /** Stand in for the toolgate CLI beneath the mod: records every argv + stdin, answers per subcommand. */
-function fakeCli(on: any, answers: { decide?: unknown; version?: boolean; messages?: unknown[] }) {
+function fakeCli(on: any, answers: { decide?: unknown; version?: boolean; messages?: unknown[]; keyCommand?: { stdout: string; exitCode?: number } }) {
   const calls: { argv: readonly string[]; stdin?: string; env?: Record<string, string> }[] = []
   on('process.run', async (_$: unknown, e: { argv: readonly string[]; init?: { stdin?: string; env?: Record<string, string> } }) => {
     calls.push({ argv: e.argv, stdin: e.init?.stdin, env: e.init?.env })
+    if (e.argv[0] === 'swm') return value({ ...run(answers.keyCommand?.stdout ?? ''), exitCode: answers.keyCommand?.exitCode ?? 0 })
     const sub = e.argv[1]
     if (sub === 'version') {
       if (answers.version === false) throw new Error('spawn toolgate ENOENT')
@@ -114,6 +115,33 @@ test('the API keys from settings reach the CLI as environment, nowhere else', { 
   const decide = calls.find((c) => c.argv[1] === 'decide')!
   expect(decide.env).toEqual({ TYPESAFE_API_KEY: 'ts-secret' })
   expect(decide.stdin!.includes('ts-secret')).toBe(false)
+})
+
+test('a key command supplies the key once, cached, and the CLI is not asked to run it', { options: { typesafe_api_key_command: 'swm read TYPESAFE_API_KEY' } }, async ($, on) => {
+  const calls = fakeCli(on, { decide: { verdict: 'allow', source: 'model' }, keyCommand: { stdout: 'cmd-secret' } })
+  await start($)
+  await $.tool.check({ tool: 'Bash', input: { command: 'ls' } })
+  await $.tool.check({ tool: 'Bash', input: { command: 'pwd' } })
+  expect(calls.filter((c) => c.argv[0] === 'swm').map((c) => c.argv)).toEqual([['swm', 'read', 'TYPESAFE_API_KEY']])
+  const decides = calls.filter((c) => c.argv[1] === 'decide')
+  expect(decides.map((c) => c.env)).toEqual(Array(2).fill({ TYPESAFE_API_KEY: 'cmd-secret', TYPESAFE_API_KEY_COMMAND: '' }))
+  expect(decides.every((c) => !c.stdin!.includes('cmd-secret'))).toBe(true)
+})
+
+test('a failing key command leaves no key and never reaches the verdict text', { options: { typesafe_api_key_command: 'swm read TYPESAFE_API_KEY' } }, async ($, on) => {
+  const calls = fakeCli(on, { decide: { verdict: 'allow', source: 'model' }, keyCommand: { stdout: 'cmd-secret', exitCode: 1 } })
+  await start($)
+  const verdict = await $.tool.check({ tool: 'Bash', input: { command: 'ls' } })
+  expect(calls.find((c) => c.argv[1] === 'decide')!.env).toEqual({ TYPESAFE_API_KEY_COMMAND: '' })
+  expect(JSON.stringify(verdict).includes('cmd-secret')).toBe(false)
+})
+
+test('a configured key wins and the key command is not run', { options: { typesafe_api_key: 'ts-secret', typesafe_api_key_command: 'swm read TYPESAFE_API_KEY' } }, async ($, on) => {
+  const calls = fakeCli(on, { decide: { verdict: 'allow', source: 'model' } })
+  await start($)
+  await $.tool.check({ tool: 'Bash', input: { command: 'ls' } })
+  expect(calls.some((c) => c.argv[0] === 'swm')).toBe(false)
+  expect(calls.find((c) => c.argv[1] === 'decide')!.env).toEqual({ TYPESAFE_API_KEY: 'ts-secret' })
 })
 
 test('after the tool runs, the ledger entry is settled by outcome', async ($, on) => {
